@@ -59,10 +59,12 @@ services:
     plan: starter                                      # web is light; starter ($7/mo)
     region: oregon                                     # TODO: closest region to you
     healthCheckPath: /health/                          # attendee/urls.py
-    # Wrapped in `sh -c` because Render runs these WITHOUT a shell — otherwise `$PORT`
-    # is not expanded and `&&` is passed as literal args (verified failure 2026-06-23).
-    dockerCommand: 'sh -c "gunicorn attendee.wsgi:application --bind 0.0.0.0:$PORT"'
-    preDeployCommand: 'sh -c "python manage.py migrate --noinput && python manage.py collectstatic --noinput"'
+    # Render runs these as BARE ARGV — no shell, so no &&, no quotes, no $VAR expansion
+    # (verified: both `a && b` and `sh -c "..."` failed 2026-06-23). Keep them single
+    # commands: migrate only in pre-deploy (run collectstatic once via the web shell),
+    # hardcoded port (PORT=10000 env below; Render also auto-detects the listening port).
+    dockerCommand: gunicorn attendee.wsgi:application --bind 0.0.0.0:10000
+    preDeployCommand: python manage.py migrate --noinput
     envVars:
       - fromGroup: attendee-shared
       - key: PORT
