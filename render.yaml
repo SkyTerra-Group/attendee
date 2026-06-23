@@ -1,0 +1,192 @@
+# =============================================================================
+# Render Blueprint — Self-hosted Attendee meeting bot (for SkyTerra engagement-agent)
+# =============================================================================
+#
+# WHAT THIS IS
+#   A TEMPLATE Render Blueprint that stands up the open-source Attendee meeting
+#   bot (https://github.com/attendee-labs/attendee) on Render. Attendee is free
+#   open-source SOFTWARE; the Render INFRASTRUCTURE it runs on is paid
+#   (~$48-108/mo — see docs/self-host-attendee-runbook.md). This is NOT a free
+#   deployment: Render does not offer Free-tier background workers, and Attendee
+#   requires a Celery worker to actually run bots.
+#
+# HOW TO USE
+#   Attendee publishes NO prebuilt Docker image (no GHCR/Docker Hub) and NO
+#   upstream render.yaml — verified against the repo on 2026-06-23. Render must
+#   BUILD from the Dockerfile. Because a Blueprint is Git-backed and lives in the
+#   repo it deploys, you must:
+#     1. Fork attendee-labs/attendee into a repo you control.
+#     2. Commit THIS file to that fork (e.g. at /render.yaml or via the path you
+#        point Render at), OR keep it here and set `repo:` (below) to the fork.
+#   The `repo:`/`branch:` keys below pin Render at the upstream fork so the build
+#   uses Attendee's Dockerfile. If you commit this file INTO the fork itself, you
+#   may delete the `repo:`/`branch:` lines (Render then builds the repo the
+#   Blueprint lives in).
+#
+# SOURCE OF TRUTH for every value below (verified 2026-06-23):
+#   - web/worker commands ............ Procfile (web: gunicorn attendee.wsgi /
+#                                        worker: celery -A attendee worker -l info)
+#   - prod settings module ........... attendee/settings/production.py
+#   - DATABASE_URL (NOT POSTGRES_*) .. attendee/settings/production.py reads it via
+#                                        dj_database_url.config(env="DATABASE_URL")
+#                                        — there are NO individual POSTGRES_USER/
+#                                        PASSWORD/DB/PORT/HOST vars in production.
+#   - REDIS_URL ...................... attendee/settings/base.py (concatenated into
+#                                        Celery broker; boot CRASHES if unset)
+#   - DJANGO_SECRET_KEY / CREDENTIALS_ENCRYPTION_KEY ... attendee/settings/base.py
+#                                        (both required, no default)
+#   - SITE_DOMAIN .................... attendee/settings/base.py (default
+#                                        "app.attendee.dev" — MUST be overridden)
+#   - DISABLE_EMAIL / DISABLE_SIGNUP . attendee/settings/production.py + base.py
+#   - POSTGRES_SSL_REQUIRE ........... attendee/settings/production.py (default true)
+#   - LAUNCH_ADHOC_BOTS_ASYNC ........ attendee/settings/base.py (default false →
+#                                        we set true so bots run in the worker, not
+#                                        inline in the web request)
+#   - ENABLE_CHROME_SANDBOX=false .... dev.docker-compose.yaml (worker setting)
+#   - LAUNCH_BOT_METHOD .............. INTENTIONALLY OMITTED. bots/launch_bot_utils.py
+#                                        falls back to Celery for any value that is
+#                                        not "kubernetes"/"docker-compose-multi-host".
+#                                        Do NOT set it to kubernetes on Render.
+#   - healthCheckPath /health/ ....... attendee/urls.py
+#   - no EXPOSE / prebuilt image ..... Dockerfile (FROM ubuntu:22.04, ENTRYPOINT
+#                                        tini→entrypoint.sh, CMD bash; entrypoint
+#                                        starts PulseAudio then exec's dockerCommand)
+#
+# NOT INCLUDED ON PURPOSE (add only when the operator opts in):
+#   - AWS S3 (AWS_RECORDING_STORAGE_BUCKET_NAME / AWS_ACCESS_KEY_ID / _SECRET /
+#     _DEFAULT_REGION): only needed if you keep VIDEO RECORDINGS. The free
+#     transcript-only path uses meeting closed-captions and a create-bot payload
+#     of recording_settings={"format":"none"}. STORAGES is configured at import,
+#     but the S3 bucket env defaults to None and is only exercised when a recording
+#     file is actually uploaded. See runbook "S3 requirement".
+#   - Deepgram / OpenAI / other STT keys: NOT required for Teams/Meet captions ($0).
+#   - Zoom (zoom client id/secret): only for Zoom meetings; Meet+Teams need none.
+#   - webpage-streamer service: in dev.docker-compose.yaml it is behind an OPTIONAL
+#     compose profile (port 8001), NOT an always-on service, and bots launch via
+#     Celery in the worker — so it is OMITTED from this base Blueprint.
+#   - scheduler (`python manage.py run_scheduler`): only needed for Attendee-managed
+#     CALENDAR / scheduled bots. SkyTerra dispatches ad-hoc bots (POST /api/v1/bots),
+#     so the scheduler is OMITTED. Add it as a second `type: worker` if you later
+#     use Attendee's calendar features.
+#
+# =============================================================================
+
+databases:
+  - name: attendee-postgres
+    # Render Postgres. basic-256mb is the cheapest persistent paid tier (~$6/mo).
+    # Do NOT use the Free tier: Free Postgres expires after 30 days.
+    plan: basic-256mb
+    # databaseName + user auto-generated by Render if omitted.
+
+services:
+  # ---------------------------------------------------------------------------
+  # Web (Django/Gunicorn) — serves the Attendee dashboard + REST API
+  # ---------------------------------------------------------------------------
+  - name: attendee-web
+    type: web
+    runtime: docker
+    repo: https://github.com/attendee-labs/attendee   # TODO: change to YOUR fork
+    branch: main                                       # TODO: pin to a known-good SHA/tag for reproducibility
+    plan: starter                                      # web is light; starter ($7/mo) is fine
+    region: oregon                                     # TODO: pick the region closest to your meetings/SkyTerra app
+    healthCheckPath: /health/                          # attendee/urls.py
+    # Render terminates TLS and routes to $PORT (default 10000). Upstream Procfile
+    # is `gunicorn attendee.wsgi` with no bind; we add an explicit Render bind.
+    dockerCommand: gunicorn attendee.wsgi:application --bind 0.0.0.0:$PORT
+    # entrypoint.sh does NOT migrate or collectstatic — do it pre-start (web only).
+    preDeployCommand: python manage.py migrate --noinput && python manage.py collectstatic --noinput
+    # dockerfilePath defaults to ./Dockerfile at repo root (correct for Attendee).
+    envVars:
+      - fromGroup: attendee-shared
+      - key: PORT
+        value: "10000"
+
+  # ---------------------------------------------------------------------------
+  # Worker (Celery) — runs the actual browser meeting bots AND delivers webhooks
+  # ---------------------------------------------------------------------------
+  # CRITICAL: this worker runs full Chrome + Xvfb + PulseAudio + ffmpeg/GStreamer
+  # per bot. Attendee's k8s defaults request 4 CPU / 4 GiB per bot pod, so a small
+  # Render worker is a real risk. Start at `standard` (1 CPU / 2 GiB, ~$25/mo) to
+  # validate cheaply; upgrade to `pro` (2 CPU / 4 GiB, ~$85/mo) if bots OOM/crash.
+  # The same worker also runs deliver_webhook tasks — if it is down or saturated by
+  # a long meeting, SkyTerra's completion webhook (and thus the transcript) stalls.
+  - name: attendee-worker
+    type: worker
+    runtime: docker
+    repo: https://github.com/attendee-labs/attendee   # TODO: change to YOUR fork (must match web)
+    branch: main                                       # TODO: keep in sync with attendee-web
+    plan: standard                                     # TODO: bump to `pro` if bots OOM (see runbook blockers)
+    region: oregon                                     # TODO: must match attendee-web region
+    # --concurrency=1 is an intentional Render guardrail (NOT in upstream Procfile):
+    # one Chrome bot per worker process. Bot tasks have a 1-hour Celery soft limit.
+    dockerCommand: celery -A attendee worker -l info --concurrency=1
+    envVars:
+      - fromGroup: attendee-shared
+      - key: ENABLE_CHROME_SANDBOX
+        value: "false"   # dev.docker-compose.yaml sets this for the worker
+
+  # ---------------------------------------------------------------------------
+  # Key Value (Redis) — Celery broker + result backend
+  # ---------------------------------------------------------------------------
+  - name: attendee-redis
+    type: keyvalue
+    plan: starter            # Free Key Value is in-memory only and loses the queue on restart
+    region: oregon           # TODO: must match the web/worker region
+    ipAllowList: []          # [] = internal connections ONLY (required field; correct default for a private broker)
+    maxmemoryPolicy: noeviction   # never evict queued Celery jobs
+
+# =============================================================================
+# Shared environment (applied to BOTH web and worker)
+# =============================================================================
+envVarGroups:
+  - name: attendee-shared
+    envVars:
+      # --- Django / boot (Found: production.py, base.py) ---
+      - key: DJANGO_SETTINGS_MODULE
+        value: attendee.settings.production
+      - key: DJANGO_SECRET_KEY
+        generateValue: true        # opaque random secret — Render-generated is fine
+      # CREDENTIALS_ENCRYPTION_KEY MUST be a Fernet key (init_env.py uses
+      # Fernet.generate_key()). Render generateValue is base64 but NOT guaranteed
+      # Fernet-shaped, so prompt for it. Generate with:
+      #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      - key: CREDENTIALS_ENCRYPTION_KEY
+        sync: false                # operator pastes the Fernet key at create time
+
+      # --- Connections (Found: production.py uses dj_database_url(DATABASE_URL); base.py uses REDIS_URL) ---
+      - key: DATABASE_URL
+        fromDatabase:
+          name: attendee-postgres
+          property: connectionString
+      - key: POSTGRES_SSL_REQUIRE
+        value: "true"              # production.py default; Render Postgres uses SSL
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: attendee-redis
+          property: connectionString
+
+      # --- Site / URL identity (Found: base.py SITE_DOMAIN default app.attendee.dev) ---
+      # SITE_DOMAIN must be the Render hostname WITHOUT scheme. Render does not inject
+      # the final hostname into a Blueprint env at first sync, and worker services do
+      # NOT get RENDER_EXTERNAL_HOSTNAME — so this is operator-set after the URL exists.
+      # TODO(operator): set to e.g. attendee-web-xxxx.onrender.com (no https://), then redeploy.
+      - key: SITE_DOMAIN
+        sync: false
+
+      # --- Bootstrap / behavior (Found: production.py, base.py, launch_bot_utils.py) ---
+      - key: DISABLE_EMAIL
+        value: "true"              # console-only email; read the signup-confirmation link from web logs
+      - key: DISABLE_SIGNUP
+        value: "false"             # TODO(operator): flip to "true" AFTER you create the first account
+      - key: LAUNCH_ADHOC_BOTS_ASYNC
+        value: "true"              # run bots in the worker, not inline in the web request
+      # LAUNCH_BOT_METHOD intentionally NOT set → Attendee uses the Celery path.
+      # CHARGE_CREDITS_FOR_BOTS defaults false (base.py) → leave unset (no credit gating).
+
+      # --- Optional knobs (defaults are correct for Render-to-Render; listed for visibility) ---
+      # REQUIRE_HTTPS_WEBHOOKS defaults true (base.py) — SkyTerra's callback is https, OK.
+      # REQUIRE_PUBLIC_WEBHOOK_URLS defaults false (base.py) — leave unset; if you flip it
+      #   true, localhost/ngrok callbacks are rejected (Render-to-Render still passes).
+      # EXTERNAL_WEBHOOK_SITE_DOMAIN (base.py) overrides SITE_DOMAIN for outbound URLs;
+      #   only needed if Attendee's own webhook URLs must differ from SITE_DOMAIN.
