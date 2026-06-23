@@ -59,8 +59,10 @@ services:
     plan: starter                                      # web is light; starter ($7/mo)
     region: oregon                                     # TODO: closest region to you
     healthCheckPath: /health/                          # attendee/urls.py
-    dockerCommand: gunicorn attendee.wsgi:application --bind 0.0.0.0:$PORT
-    preDeployCommand: python manage.py migrate --noinput && python manage.py collectstatic --noinput
+    # Wrapped in `sh -c` because Render runs these WITHOUT a shell — otherwise `$PORT`
+    # is not expanded and `&&` is passed as literal args (verified failure 2026-06-23).
+    dockerCommand: 'sh -c "gunicorn attendee.wsgi:application --bind 0.0.0.0:$PORT"'
+    preDeployCommand: 'sh -c "python manage.py migrate --noinput && python manage.py collectstatic --noinput"'
     envVars:
       - fromGroup: attendee-shared
       - key: PORT
