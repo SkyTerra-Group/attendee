@@ -10,7 +10,23 @@ from bots.bot_controller import BotController
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, soft_time_limit=3600)
+# SkyTerra: the upstream value (3600s) is measured from when the WORKER PICKS THE
+# TASK UP, not from when the bot is admitted to the meeting. A bot dispatched
+# 10 minutes early therefore has ~50 minutes of meeting left, and when the limit
+# fires Celery raises SoftTimeLimitExceeded INSIDE the task: the bot is torn out
+# of a LIVE call and post-processing never runs, so the recording it already made
+# is LOST (2026-09-02 bot_bdHe6itHEXbIqKiS: recording_state/transcription_state
+# both "complete" provider-side, transcript_id NULL app-side).
+#
+# Env-tunable here (upstream hardcodes it). Ordering that must hold on the
+# worker's dockerCommand and the broker:
+#     soft (this, 10800) < hard --time-limit (12000) < visibility_timeout (14400)
+# If this is raised, raise those too, and set BOT_PROVIDER_SOFT_CAP_SECONDS on
+# the engagement app to match so its handoff sweep stops guessing.
+BOT_SOFT_TIME_LIMIT_SECONDS = int(os.getenv("BOT_SOFT_TIME_LIMIT_SECONDS", "10800"))
+
+
+@shared_task(bind=True, soft_time_limit=BOT_SOFT_TIME_LIMIT_SECONDS)
 def run_bot(self, bot_id):
     logger.info(f"Running bot {bot_id}")
     bot_controller = BotController(bot_id)
