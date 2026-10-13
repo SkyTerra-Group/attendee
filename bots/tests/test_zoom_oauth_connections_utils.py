@@ -14,6 +14,7 @@ from bots.models import (
 from bots.zoom_oauth_connections_utils import (
     ONBEHALF_TOKEN_FAILURE_CONNECTION_DOES_NOT_SUPPORT_ONBEHALF_TOKENS,
     ONBEHALF_TOKEN_FAILURE_CONNECTION_NOT_FOUND,
+    ONBEHALF_TOKEN_FAILURE_NO_MEETING_ID,
     ONBEHALF_TOKEN_FAILURE_NO_ZOOM_OAUTH_APP,
     ONBEHALF_TOKEN_FAILURE_ZOOM_API_AUTHENTICATION_ERROR,
     ONBEHALF_TOKEN_FAILURE_ZOOM_API_ERROR,
@@ -372,6 +373,20 @@ class TestGetZoomTokensFailsClosedForOnbehalfBots(TestCase):
             get_zoom_tokens_via_zoom_oauth_app(bot)
 
         self.assertEqual(raised.exception.failure_reason, ONBEHALF_TOKEN_FAILURE_CONNECTION_DOES_NOT_SUPPORT_ONBEHALF_TOKENS)
+        mock_post.assert_not_called()
+        mock_session.assert_not_called()
+
+    @patch("bots.zoom_oauth_connections_utils.requests.Session")
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_raises_without_any_zoom_call_when_meeting_url_has_no_meeting_id(self, mock_post, mock_session):
+        # The bot API rejects a Zoom URL without a numeric meeting id, so this guards a bot stored another way,
+        # for example with a personal link (zoom.us/my/<name>) saved directly.
+        bot = self._create_bot(onbehalf_user_id="obf_user_id", meeting_url="https://zoom.us/my/obfuserroom")
+
+        with self.assertRaises(ZoomOnbehalfTokenUnavailableError) as raised:
+            get_zoom_tokens_via_zoom_oauth_app(bot)
+
+        self.assertEqual(raised.exception.failure_reason, ONBEHALF_TOKEN_FAILURE_NO_MEETING_ID)
         mock_post.assert_not_called()
         mock_session.assert_not_called()
 
