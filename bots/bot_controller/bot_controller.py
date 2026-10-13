@@ -63,7 +63,7 @@ from bots.per_participant_realtime_video_configuration import (
 from bots.webhook_payloads import chat_message_webhook_payload, participant_event_webhook_payload, utterance_webhook_payload
 from bots.webhook_utils import trigger_webhook
 from bots.websocket_payloads import mixed_audio_websocket_payload, per_participant_audio_websocket_payload, per_participant_video_websocket_payload
-from bots.zoom_oauth_connections_utils import get_zoom_tokens_via_zoom_oauth_app
+from bots.zoom_oauth_connections_utils import ZoomOnbehalfTokenUnavailableError, get_zoom_tokens_via_zoom_oauth_app
 from bots.zoom_rtms_adapter.rtms_gstreamer_pipeline import RTMSGstreamerPipeline
 
 from .audio_chunk_uploader import AudioChunkUploader
@@ -312,6 +312,10 @@ class BotController:
         return self.get_zoom_oauth_credentials_via_zoom_oauth_app() or self.get_zoom_oauth_credentials_via_credentials_record()
 
     def get_zoom_tokens(self):
+        # SkyTerra: an onbehalf bot fetched its tokens once, before anything else in run().
+        if self.prefetched_zoom_tokens is not None:
+            return self.prefetched_zoom_tokens
+
         zoom_tokens = {}
         if self.bot_in_db.zoom_tokens_callback_url():
             zoom_tokens = get_zoom_tokens(self.bot_in_db)
@@ -327,6 +331,73 @@ class BotController:
 
     def get_zoom_oauth_credentials_and_tokens(self):
         return self.get_zoom_oauth_credentials(), self.get_zoom_tokens()
+
+    # SkyTerra: the reason recorded in the event metadata when an onbehalf bot is ended
+    # because its onbehalf token could not be obtained.
+    ONBEHALF_TOKEN_UNAVAILABLE_REASON = "onbehalf_token_unavailable"
+
+    def zoom_onbehalf_token_was_requested(self):
+        """True for a Zoom meeting bot created with zoom_settings.onbehalf_token whose tokens come from the project's Zoom OAuth app."""
+        if self.is_using_rtms():
+            return False
+        if meeting_type_from_url(self.bot_in_db.meeting_url) != MeetingTypes.ZOOM:
+            return False
+        # Tokens from the customer's own callback are the customer's responsibility; unchanged.
+        if self.bot_in_db.zoom_tokens_callback_url():
+            return False
+        return bool(self.bot_in_db.zoom_onbehalf_token_zoom_oauth_connection_user_id())
+
+    def end_bot_if_zoom_onbehalf_token_unavailable(self):
+        """
+        SkyTerra: fail closed for onbehalf (OBF) Zoom bots.
+
+        Upstream fetches the onbehalf token while building the adapter and, if the fetch fails,
+        joins without it, i.e. anonymously. For a bot that asked to join on behalf of a user
+        we fetch the tokens first, before any pipeline, recorder, Redis subscription or adapter
+        exists. If no onbehalf token can be obtained the bot is ended with a terminal event and
+        this returns True; the caller must then return without joining. Otherwise the tokens are
+        kept for the adapter (no second fetch) and this returns False.
+
+        Bots that did not ask for an onbehalf token are untouched: this returns False without
+        fetching anything.
+        """
+        if not self.zoom_onbehalf_token_was_requested():
+            return False
+
+        try:
+            self.prefetched_zoom_tokens = self.get_zoom_tokens()
+            return False
+        except ZoomOnbehalfTokenUnavailableError as e:
+            self.end_bot_because_zoom_onbehalf_token_unavailable(e.failure_reason)
+            return True
+
+    def end_bot_because_zoom_onbehalf_token_unavailable(self, failure_reason):
+        logger.warning(f"Bot {self.bot_in_db.object_id} asked to join on behalf of a Zoom user but no onbehalf token could be obtained ({failure_reason}). Ending the bot instead of joining without it.")
+        event_metadata = {
+            "reason": self.ONBEHALF_TOKEN_UNAVAILABLE_REASON,
+            "onbehalf_token_failure_reason": failure_reason,
+            "message": f"The bot was asked to join on behalf of a Zoom user, but no onbehalf token could be obtained for that user ({failure_reason}). The bot did not join, so it never joined without the token.",
+        }
+        self.bot_in_db.refresh_from_db()
+        try:
+            if self.bot_in_db.state in [BotStates.JOINING, BotStates.WAITING_ROOM]:
+                BotEventManager.create_event(
+                    bot=self.bot_in_db,
+                    event_type=BotEventTypes.COULD_NOT_JOIN,
+                    event_sub_type=BotEventSubTypes.COULD_NOT_JOIN_MEETING_ZOOM_AUTHORIZATION_FAILED,
+                    event_metadata=event_metadata,
+                )
+            else:
+                # e.g. a scheduled bot that is still STAGED; COULD_NOT_JOIN is only valid while joining.
+                BotEventManager.create_event(
+                    bot=self.bot_in_db,
+                    event_type=BotEventTypes.FATAL_ERROR,
+                    event_sub_type=BotEventSubTypes.FATAL_ERROR_ATTENDEE_INTERNAL_ERROR,
+                    event_metadata=event_metadata,
+                )
+        except Exception as e:
+            # Never fall through to a join: the bot stays out of the meeting even if the event cannot be recorded.
+            logger.exception(f"Could not record the onbehalf token failure for bot {self.bot_in_db.object_id} in state {BotStates.state_to_api_code(self.bot_in_db.state)}: {e}")
 
     def get_zoom_web_bot_adapter(self):
         from bots.zoom_web_bot_adapter import ZoomWebBotAdapter
@@ -720,6 +791,7 @@ class BotController:
         self.bot_in_db = Bot.objects.get(id=bot_id)
         self.cleanup_called = False
         self.run_called = False
+        self.prefetched_zoom_tokens = None
 
         self.redis_client = None
         self.pubsub = None
@@ -845,6 +917,11 @@ class BotController:
         if self.run_called:
             raise Exception("Run already called, exiting")
         self.run_called = True
+
+        # SkyTerra: an onbehalf Zoom bot whose token cannot be obtained ends here, before anything
+        # is set up, and never attempts to join.
+        if self.end_bot_if_zoom_onbehalf_token_unavailable():
+            return
 
         self.connect_to_redis()
 
