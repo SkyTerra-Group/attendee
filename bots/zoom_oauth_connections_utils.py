@@ -284,48 +284,95 @@ def get_local_recording_token_via_zoom_oauth_app(bot: Bot) -> str | None:
         return None
 
 
-def get_onbehalf_token_via_zoom_oauth_app(bot: Bot) -> str | None:
+class ZoomOnbehalfTokenUnavailableError(Exception):
+    """
+    SkyTerra: raised when a bot was created with zoom_settings.onbehalf_token but no
+    onbehalf token could be obtained for that Zoom OAuth connection.
+
+    Upstream degrades this case to a join WITHOUT the token, i.e. an anonymous join.
+    A bot that asked to join on behalf of a user must never do that, so the token
+    lookup fails closed and the bot controller ends the bot instead of joining.
+
+    failure_reason is one of the ONBEHALF_TOKEN_FAILURE_* values below.
+    """
+
+    def __init__(self, failure_reason: str):
+        self.failure_reason = failure_reason
+        super().__init__(f"Onbehalf token unavailable: {failure_reason}")
+
+
+# Machine-readable reasons why an onbehalf token could not be obtained.
+ONBEHALF_TOKEN_FAILURE_NO_ZOOM_OAUTH_APP = "no_zoom_oauth_app"
+ONBEHALF_TOKEN_FAILURE_CONNECTION_NOT_FOUND = "zoom_oauth_connection_not_found"
+ONBEHALF_TOKEN_FAILURE_CONNECTION_DOES_NOT_SUPPORT_ONBEHALF_TOKENS = "zoom_oauth_connection_does_not_support_onbehalf_tokens"
+ONBEHALF_TOKEN_FAILURE_NO_MEETING_ID = "no_meeting_id_in_meeting_url"
+ONBEHALF_TOKEN_FAILURE_ZOOM_API_AUTHENTICATION_ERROR = "zoom_api_authentication_error"
+ONBEHALF_TOKEN_FAILURE_ZOOM_API_ERROR = "zoom_api_error"
+ONBEHALF_TOKEN_FAILURE_ZOOM_API_RETURNED_NO_TOKEN = "zoom_api_returned_no_token"
+
+
+def _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot: Bot) -> tuple[str | None, str | None]:
+    """
+    Returns (onbehalf_token, None) on success, (None, None) when the bot did not ask for an
+    onbehalf token, and (None, failure_reason) when it asked for one and none could be obtained.
+    """
     user_id_for_onbehalf_token = bot.zoom_onbehalf_token_zoom_oauth_connection_user_id()
     if not user_id_for_onbehalf_token:
-        return None
+        return None, None
 
     project = bot.project
     zoom_oauth_app = project.zoom_oauth_apps.first()
     if not zoom_oauth_app:
-        return None
+        return None, ONBEHALF_TOKEN_FAILURE_NO_ZOOM_OAUTH_APP
 
     zoom_oauth_connection = ZoomOAuthConnection.objects.filter(zoom_oauth_app=zoom_oauth_app, user_id=user_id_for_onbehalf_token).first()
     if not zoom_oauth_connection:
-        return None
+        return None, ONBEHALF_TOKEN_FAILURE_CONNECTION_NOT_FOUND
 
     if not zoom_oauth_connection.is_onbehalf_token_supported:
         logger.info(f"Zoom oauth connection {zoom_oauth_connection.object_id} does not support onbehalf tokens, skipping")
-        return None
+        return None, ONBEHALF_TOKEN_FAILURE_CONNECTION_DOES_NOT_SUPPORT_ONBEHALF_TOKENS
 
     meeting_url = bot.meeting_url
 
     meeting_id, password = parse_zoom_join_url(meeting_url)
     if not meeting_id:
         logger.info(f"No meeting id found in join url {meeting_url}")
-        return None
+        return None, ONBEHALF_TOKEN_FAILURE_NO_MEETING_ID
 
     try:
         access_token = _get_access_token(zoom_oauth_connection)
         onbehalf_token = _get_onbehalf_token(meeting_id, access_token)
-        return onbehalf_token
+        if not onbehalf_token:
+            return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_RETURNED_NO_TOKEN
+        return onbehalf_token, None
 
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
         logger.exception(f"Failed to get onbehalf token via zoom oauth app with user id {user_id_for_onbehalf_token}: {e}. This was considered an authentication error.")
-        return None
+        return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_AUTHENTICATION_ERROR
 
     except Exception as e:
         logger.exception(f"Failed to get onbehalf token via zoom oauth app with user id {user_id_for_onbehalf_token}: {e}")
-        return None
+        return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_ERROR
+
+
+def get_onbehalf_token_via_zoom_oauth_app(bot: Bot) -> str | None:
+    onbehalf_token, _ = _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot)
+    return onbehalf_token
 
 
 def get_zoom_tokens_via_zoom_oauth_app(bot: Bot) -> dict | None:
-    onbehalf_token = get_onbehalf_token_via_zoom_oauth_app(bot)
+    """
+    Raises ZoomOnbehalfTokenUnavailableError when the bot asked for an onbehalf token
+    (zoom_settings.onbehalf_token) and none could be obtained. Bots that did not ask
+    for one are unaffected.
+    """
+    onbehalf_token, onbehalf_token_failure_reason = _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot)
+    if onbehalf_token_failure_reason:
+        # Fail closed: never hand back a token set that would make an onbehalf bot join anonymously.
+        raise ZoomOnbehalfTokenUnavailableError(onbehalf_token_failure_reason)
+
     local_recording_token = get_local_recording_token_via_zoom_oauth_app(bot)
 
     return {
