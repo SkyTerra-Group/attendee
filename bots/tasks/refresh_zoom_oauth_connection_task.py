@@ -4,7 +4,14 @@ from django.db import transaction
 from django.utils import timezone
 
 from bots.models import ZoomOAuthConnection, ZoomOAuthConnectionStates
-from bots.zoom_oauth_connections_utils import ZoomAPIAuthenticationError, ZoomAPIError, _get_access_token, _handle_zoom_api_authentication_error
+from bots.zoom_oauth_connections_utils import (
+    ZoomAPIAuthenticationError,
+    ZoomAPIError,
+    ZoomOAuthConnectionRemovalFenced,
+    _get_access_token,
+    _handle_zoom_api_authentication_error,
+    update_zoom_oauth_connection_if_writable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +47,27 @@ def refresh_zoom_oauth_connection(self, zoom_oauth_connection_id):
             raise ZoomAPIError("No access token returned from Zoom API")
 
         # Update zoom oauth connection sync success timestamp and window
-        zoom_oauth_connection.last_attempted_token_refresh_at = timezone.now()
-        zoom_oauth_connection.last_successful_token_refresh_at = zoom_oauth_connection.last_attempted_token_refresh_at
-        zoom_oauth_connection.state = ZoomOAuthConnectionStates.CONNECTED
-        zoom_oauth_connection.connection_failure_data = None
-        zoom_oauth_connection.save()
+        completed_at = timezone.now()
+        update_zoom_oauth_connection_if_writable(
+            zoom_oauth_connection,
+            last_attempted_token_refresh_at=completed_at,
+            last_successful_token_refresh_at=completed_at,
+            state=ZoomOAuthConnectionStates.CONNECTED,
+            connection_failure_data=None,
+        )
 
         logger.info(f"Successfully refreshed zoom oauth connection token for zoom oauth connection {zoom_oauth_connection_id}")
+
+    except ZoomOAuthConnectionRemovalFenced:
+        return
 
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
 
     except Exception as e:
         logger.exception(f"Zoom OAuth connection token refresh failed with {type(e).__name__} for {zoom_oauth_connection_id}: {e}")
-        zoom_oauth_connection.last_attempted_token_refresh_at = timezone.now()
-        zoom_oauth_connection.save()
+        try:
+            update_zoom_oauth_connection_if_writable(zoom_oauth_connection, last_attempted_token_refresh_at=timezone.now())
+        except ZoomOAuthConnectionRemovalFenced:
+            return
         raise

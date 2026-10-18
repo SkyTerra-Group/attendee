@@ -465,6 +465,8 @@ def delete_bot(bot: Bot) -> tuple[bool, dict | None]:
     # Check if bot is in scheduled state
     if bot.state != BotStates.SCHEDULED:
         return False, {"error": f"Bot is in state {BotStates.state_to_api_code(bot.state)} but can only be deleted when in scheduled state"}
+    if bot.removal_requested_at is not None:
+        return False, {"error": "Bot deletion is already controlled by a removal operation"}
 
     try:
         bot.delete()

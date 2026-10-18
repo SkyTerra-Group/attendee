@@ -15,6 +15,9 @@ def launch_scheduled_bot(self, bot_id: int, bot_join_at: str):
     # Transition the bot to STAGED
     bot = Bot.objects.get(id=bot_id)
 
+    if bot.removal_requested_at is not None:
+        return
+
     if bot.state != BotStates.SCHEDULED:
         logger.info(f"Bot {bot_id} ({bot.object_id}) is not in state SCHEDULED, skipping")
         return

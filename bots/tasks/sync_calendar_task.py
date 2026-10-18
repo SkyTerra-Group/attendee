@@ -84,7 +84,7 @@ def sync_bot_with_calendar_event(bot: Bot, calendar_event: CalendarEvent):
 
 def sync_bots_for_calendar_event(calendar_event: CalendarEvent):
     """Sync the scheduled bots of a calendar event. Bots for the event that are not in the scheduled state cannot be changed so will be ignored."""
-    for bot in calendar_event.bots.filter(state=BotStates.SCHEDULED):
+    for bot in calendar_event.bots.filter(state=BotStates.SCHEDULED, removal_requested_at__isnull=True):
         sync_bot_with_calendar_event(bot, calendar_event)
 
 

@@ -5,6 +5,7 @@ import math
 import os
 import secrets
 import string
+import uuid
 from datetime import timedelta
 
 from concurrency.exceptions import RecordModifiedError
@@ -323,6 +324,7 @@ class ZoomOAuthApp(models.Model):
 class ZoomOAuthConnectionStates(models.IntegerChoices):
     CONNECTED = 1
     DISCONNECTED = 2
+    REMOVING = 3
 
 
 class ZoomOAuthConnection(models.Model):
@@ -334,6 +336,7 @@ class ZoomOAuthConnection(models.Model):
     connection_failure_data = models.JSONField(null=True, default=None)
     user_id = models.CharField(max_length=255)
     account_id = models.CharField(max_length=255)
+    authorization_generation = models.UUIDField(default=uuid.uuid4, editable=False)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -367,6 +370,15 @@ class ZoomOAuthConnection(models.Model):
         self._encrypted_data = f.encrypt(json_data.encode())
         self.save()
 
+    def replace_authorization_credentials(self, credentials_dict):
+        """Install a newly verified OAuth grant as a fresh generation."""
+
+        f = Fernet(settings.CREDENTIALS_ENCRYPTION_KEY)
+        json_data = json.dumps(credentials_dict)
+        self._encrypted_data = f.encrypt(json_data.encode())
+        self.authorization_generation = uuid.uuid4()
+        self.save(_authorization_replacement=True)
+
     def get_credentials(self):
         """Decrypt and return credentials"""
         if not self._encrypted_data:
@@ -376,6 +388,14 @@ class ZoomOAuthConnection(models.Model):
         return json.loads(decrypted_data.decode())
 
     def save(self, *args, **kwargs):
+        authorization_replacement = kwargs.pop("_authorization_replacement", False)
+        if self.pk:
+            persisted = type(self).objects.filter(pk=self.pk).values("state", "authorization_generation").first()
+            if persisted:
+                if persisted["authorization_generation"] != self.authorization_generation and not authorization_replacement:
+                    raise ValidationError("Zoom OAuth authorization generation is immutable")
+                if persisted["state"] == ZoomOAuthConnectionStates.REMOVING and self.state != ZoomOAuthConnectionStates.REMOVING and not authorization_replacement:
+                    raise ValidationError("Zoom OAuth connection removal fence is active")
         if not self.object_id:
             # Generate a random 16-character string
             random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
@@ -432,6 +452,7 @@ class ZoomRemovalOperation(models.Model):
     source = models.CharField(max_length=32, choices=ZoomRemovalOperationSources.choices, null=True, blank=True)
     target_digest = models.CharField(max_length=64)
     target_object_id = models.CharField(max_length=32, null=True, blank=True)
+    target_generation = models.UUIDField(null=True, blank=True)
     state = models.CharField(max_length=32, choices=ZoomRemovalOperationStates.choices, default=ZoomRemovalOperationStates.PENDING)
     phase = models.CharField(max_length=32, choices=ZoomRemovalOperationPhases.choices, default=ZoomRemovalOperationPhases.PENDING)
     failure_code = models.CharField(max_length=64, null=True, blank=True)
@@ -938,6 +959,19 @@ class Bot(models.Model):
 
     first_heartbeat_timestamp = models.IntegerField(null=True, blank=True)
     last_heartbeat_timestamp = models.IntegerField(null=True, blank=True)
+
+    # A removal request fences every supported launch path before runtime
+    # absence can be proved.  Runtime identity/proof is generation-bound so a
+    # stale cleanup result cannot authorize deletion of a later launch.
+    removal_requested_at = models.DateTimeField(null=True, blank=True)
+    runtime_generation = models.UUIDField(default=uuid.uuid4, editable=False)
+    runtime_backend = models.CharField(max_length=32, null=True, blank=True)
+    runtime_identifier = models.CharField(max_length=255, null=True, blank=True)
+    runtime_launch_started_at = models.DateTimeField(null=True, blank=True)
+    runtime_launch_completed_at = models.DateTimeField(null=True, blank=True)
+    runtime_launch_in_progress = models.BooleanField(default=False)
+    runtime_absence_confirmed_at = models.DateTimeField(null=True, blank=True)
+    runtime_absence_generation = models.UUIDField(null=True, blank=True)
 
     join_at = models.DateTimeField(null=True, blank=True, help_text="The time the bot should join the meeting")
     deduplication_key = models.CharField(max_length=1024, null=True, blank=True, help_text="Optional key for deduplicating bots")

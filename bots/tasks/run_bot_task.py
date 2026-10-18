@@ -1,11 +1,13 @@
 import logging
 import os
 import signal
+import uuid
 
 from celery import shared_task
 from celery.signals import worker_shutting_down
 
 from bots.bot_controller import BotController
+from bots.bot_runtime_fence import claim_bot_runtime_launch, complete_bot_runtime_launch, runtime_launch_is_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +29,25 @@ BOT_SOFT_TIME_LIMIT_SECONDS = int(os.getenv("BOT_SOFT_TIME_LIMIT_SECONDS", "1080
 
 
 @shared_task(bind=True, soft_time_limit=BOT_SOFT_TIME_LIMIT_SECONDS)
-def run_bot(self, bot_id):
+def run_bot(self, bot_id, runtime_generation=None):
     logger.info(f"Running bot {bot_id}")
-    bot_controller = BotController(bot_id)
-    bot_controller.run()
+    if runtime_generation is None:
+        bot = claim_bot_runtime_launch(bot_id, "celery")
+        if bot is None:
+            return
+        generation = bot.runtime_generation
+    else:
+        try:
+            generation = uuid.UUID(str(runtime_generation))
+        except (TypeError, ValueError):
+            return
+        if not runtime_launch_is_allowed(bot_id, generation):
+            return
+    try:
+        bot_controller = BotController(bot_id)
+        bot_controller.run()
+    finally:
+        complete_bot_runtime_launch(bot_id, generation)
 
 
 def kill_child_processes():

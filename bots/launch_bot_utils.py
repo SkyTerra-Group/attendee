@@ -4,16 +4,23 @@ import os
 
 from django.conf import settings
 
+from bots.bot_runtime_fence import claim_bot_runtime_launch, complete_bot_runtime_launch
 from bots.models import BotEventManager, BotEventSubTypes, BotEventTypes
 
 logger = logging.getLogger(__name__)
 
 
 def launch_bot(bot):
+    backend = os.getenv("LAUNCH_BOT_METHOD", "celery") or "celery"
+    bot = claim_bot_runtime_launch(bot.id, backend)
+    if bot is None:
+        return False
+    generation = bot.runtime_generation
+
     # If this instance is running in Kubernetes, use the Kubernetes pod creator
     # which spins up a new pod for the bot
     logger.info(f"Launching bot {bot.object_id} ({bot.id}) with method {os.getenv('LAUNCH_BOT_METHOD', 'celery')}")
-    if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
+    if backend == "kubernetes":
         from .bot_pod_creator import BotPodCreator
 
         bot_pod_creator = BotPodCreator()
@@ -25,6 +32,7 @@ def launch_bot(bot):
             add_persistent_storage=bot.reserve_additional_storage(),
             bot_pod_spec_type=bot.bot_pod_spec_type,
         )
+        complete_bot_runtime_launch(bot.id, generation, runtime_identifier=create_pod_result.get("uid"))
         logger.info(f"Bot {bot.object_id} ({bot.id}) launched via Kubernetes: {create_pod_result}")
         if not create_pod_result.get("created"):
             logger.error(f"Bot {bot.object_id} ({bot.id}) failed to launch via Kubernetes.")
@@ -41,18 +49,27 @@ def launch_bot(bot):
                 )
             except Exception as e:
                 logger.error(f"Failed to create fatal error bot not launched event for bot {bot.object_id} ({bot.id}): {str(e)}")
-    elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
+    elif backend == "docker-compose-multi-host":
         # Launch bot via dedicated Celery app (bot_launcher) which uses ephemeral Docker containers
         from .tasks.run_bot_in_ephemeral_container_task import run_bot_in_ephemeral_container
 
         # Assign task to specific queue so that it gets picked up by a worker running in a bot launcher VM.
-        run_bot_in_ephemeral_container.apply_async(args=[bot.id], queue="bot_launcher_vm")
+        try:
+            run_bot_in_ephemeral_container.apply_async(args=[bot.id, str(generation)], queue="bot_launcher_vm")
+        except Exception:
+            complete_bot_runtime_launch(bot.id, generation)
+            raise
         logger.info(f"Bot {bot.object_id} ({bot.id}) launched via run_bot_in_ephemeral_container task in queue bot_launcher_vm")
     else:
         # Default to launching bot via celery
         from .tasks.run_bot_task import run_bot
 
-        run_bot.delay(bot.id)
+        try:
+            run_bot.delay(bot.id, str(generation))
+        except Exception:
+            complete_bot_runtime_launch(bot.id, generation)
+            raise
+    return True
 
 
 def launch_adhoc_bot_from_view(bot):

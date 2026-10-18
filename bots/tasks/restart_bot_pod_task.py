@@ -4,6 +4,7 @@ import time
 from celery import shared_task
 from kubernetes import client, config
 
+from bots.bot_runtime_fence import claim_bot_runtime_launch, complete_bot_runtime_launch, runtime_launch_is_allowed
 from bots.models import Bot, BotEventTypes
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,12 @@ def restart_bot_pod(self, bot_id):
     if last_bot_event.event_type != BotEventTypes.JOIN_REQUESTED:
         logger.info(f"Bot {bot_id} is not in JOINING state, so not restarting pod")
         return
+
+    claimed_bot = claim_bot_runtime_launch(bot_id, "kubernetes")
+    if claimed_bot is None:
+        return
+    bot = claimed_bot
+    runtime_generation = bot.runtime_generation
 
     # Initialize kubernetes client
     try:
@@ -81,6 +88,9 @@ def restart_bot_pod(self, bot_id):
     bot.save()
 
     bot_pod_creator = BotPodCreator()
+    if not runtime_launch_is_allowed(bot.id, runtime_generation):
+        complete_bot_runtime_launch(bot.id, runtime_generation)
+        return
     bot_pod_create_result = bot_pod_creator.create_bot_pod(
         bot_id=bot.id,
         bot_name=bot.k8s_pod_name(),
@@ -89,5 +99,6 @@ def restart_bot_pod(self, bot_id):
         add_persistent_storage=bot.reserve_additional_storage(),
         bot_pod_spec_type=bot.bot_pod_spec_type,
     )
+    complete_bot_runtime_launch(bot.id, runtime_generation, runtime_identifier=bot_pod_create_result.get("uid"))
 
     logger.info(f"Bot pod create result: {bot_pod_create_result}")

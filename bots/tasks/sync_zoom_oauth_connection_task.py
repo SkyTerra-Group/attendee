@@ -4,7 +4,17 @@ from django.db import transaction
 from django.utils import timezone
 
 from bots.models import ZoomOAuthConnection, ZoomOAuthConnectionStates
-from bots.zoom_oauth_connections_utils import ZoomAPIAuthenticationError, _get_access_token, _get_zoom_meetings, _get_zoom_personal_meeting_id, _handle_zoom_api_authentication_error, _upsert_zoom_meeting_to_zoom_oauth_connection_mapping
+from bots.zoom_oauth_connections_utils import (
+    ZoomAPIAuthenticationError,
+    ZoomOAuthConnectionRemovalFenced,
+    _assert_zoom_oauth_connection_writable,
+    _get_access_token,
+    _get_zoom_meetings,
+    _get_zoom_personal_meeting_id,
+    _handle_zoom_api_authentication_error,
+    _upsert_zoom_meeting_to_zoom_oauth_connection_mapping,
+    update_zoom_oauth_connection_if_writable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,28 +50,38 @@ def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
         sync_started_at = timezone.now()
 
         access_token = _get_access_token(zoom_oauth_connection)
+        _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         zoom_meetings = _get_zoom_meetings(access_token)
 
         logger.info(f"Fetched {len(zoom_meetings)} meetings from Zoom for zoom oauth connection {zoom_oauth_connection_id}")
 
+        _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         zoom_personal_meeting_id = _get_zoom_personal_meeting_id(access_token)
         zoom_meeting_ids = [zoom_meeting["id"] for zoom_meeting in zoom_meetings] + [zoom_personal_meeting_id]
 
         _upsert_zoom_meeting_to_zoom_oauth_connection_mapping(zoom_meeting_ids, zoom_oauth_connection)
 
         # Update zoom oauth connection sync success timestamp and window
-        zoom_oauth_connection.last_attempted_sync_at = timezone.now()
-        zoom_oauth_connection.last_successful_sync_at = zoom_oauth_connection.last_attempted_sync_at
-        zoom_oauth_connection.last_successful_sync_started_at = sync_started_at
-        zoom_oauth_connection.state = ZoomOAuthConnectionStates.CONNECTED
-        zoom_oauth_connection.connection_failure_data = None
-        zoom_oauth_connection.save()
+        completed_at = timezone.now()
+        update_zoom_oauth_connection_if_writable(
+            zoom_oauth_connection,
+            last_attempted_sync_at=completed_at,
+            last_successful_sync_at=completed_at,
+            last_successful_sync_started_at=sync_started_at,
+            state=ZoomOAuthConnectionStates.CONNECTED,
+            connection_failure_data=None,
+        )
+
+    except ZoomOAuthConnectionRemovalFenced:
+        return
 
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
 
     except Exception as e:
         logger.exception(f"Zoom OAuth connection sync failed with {type(e).__name__} for {zoom_oauth_connection_id}: {e}")
-        zoom_oauth_connection.last_attempted_sync_at = timezone.now()
-        zoom_oauth_connection.save()
+        try:
+            update_zoom_oauth_connection_if_writable(zoom_oauth_connection, last_attempted_sync_at=timezone.now())
+        except ZoomOAuthConnectionRemovalFenced:
+            return
         raise

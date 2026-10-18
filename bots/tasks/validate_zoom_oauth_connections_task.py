@@ -1,7 +1,7 @@
 import logging
 
 from bots.models import ZoomOAuthConnection, ZoomOAuthConnectionStates
-from bots.zoom_oauth_connections_utils import _get_access_token
+from bots.zoom_oauth_connections_utils import ZoomOAuthConnectionRemovalFenced, _get_access_token, update_zoom_oauth_connection_if_writable
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +42,20 @@ def validate_zoom_oauth_connections(self, zoom_oauth_app_id):
                 continue
 
             # If the access token is present, then update the state to CONNECTED
-            zoom_oauth_connection.state = ZoomOAuthConnectionStates.CONNECTED
-            zoom_oauth_connection.connection_failure_data = None
-            zoom_oauth_connection.save()
+            current = update_zoom_oauth_connection_if_writable(
+                zoom_oauth_connection,
+                state=ZoomOAuthConnectionStates.CONNECTED,
+                connection_failure_data=None,
+            )
 
             # Trigger a webhook event
             trigger_webhook(
                 webhook_trigger_type=WebhookTriggerTypes.ZOOM_OAUTH_CONNECTION_STATE_CHANGE,
-                zoom_oauth_connection=zoom_oauth_connection,
-                payload=zoom_oauth_connection_webhook_payload(zoom_oauth_connection),
+                zoom_oauth_connection=current,
+                payload=zoom_oauth_connection_webhook_payload(current),
             )
+        except ZoomOAuthConnectionRemovalFenced:
+            continue
         except Exception as e:
             logger.exception(f"Zoom OAuth connection validation failed with {type(e).__name__} for {zoom_oauth_connection.id}: {e}")
             continue

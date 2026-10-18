@@ -26,6 +26,40 @@ class ZoomAPIAuthenticationError(ZoomAPIError):
     pass
 
 
+class ZoomOAuthConnectionRemovalFenced(ZoomAPIError):
+    """Raised when work targets an authorization generation being removed."""
+
+
+def _assert_zoom_oauth_connection_writable(zoom_oauth_connection: ZoomOAuthConnection) -> None:
+    if (
+        not ZoomOAuthConnection.objects.filter(
+            pk=zoom_oauth_connection.pk,
+            authorization_generation=zoom_oauth_connection.authorization_generation,
+        )
+        .exclude(state=ZoomOAuthConnectionStates.REMOVING)
+        .exists()
+    ):
+        raise ZoomOAuthConnectionRemovalFenced()
+
+
+def _locked_writable_zoom_oauth_connection(zoom_oauth_connection: ZoomOAuthConnection) -> ZoomOAuthConnection:
+    current = ZoomOAuthConnection.objects.select_for_update().select_related("zoom_oauth_app").filter(pk=zoom_oauth_connection.pk, authorization_generation=zoom_oauth_connection.authorization_generation).first()
+    if current is None or current.state == ZoomOAuthConnectionStates.REMOVING:
+        raise ZoomOAuthConnectionRemovalFenced()
+    return current
+
+
+def update_zoom_oauth_connection_if_writable(zoom_oauth_connection: ZoomOAuthConnection, **values) -> ZoomOAuthConnection:
+    """Apply a worker result under the authorization-generation fence."""
+
+    with transaction.atomic():
+        current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
+        for field, value in values.items():
+            setattr(current, field, value)
+        current.save(update_fields=[*values.keys(), "updated_at"])
+        return current
+
+
 def client_id_and_secret_is_valid(client_id: str, client_secret: str) -> bool:
     """
     Validate Zoom OAuth client credentials without requiring a user via client_credentials grant type
@@ -92,6 +126,7 @@ def _get_access_token(zoom_oauth_connection) -> str:
     Zoom returns a new refresh_token on each successful refresh.
     Persist it so we don't lose the chain.
     """
+    _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
     credentials = zoom_oauth_connection.get_credentials()
     if not credentials:
         raise ZoomAPIAuthenticationError("No credentials found for zoom oauth connection")
@@ -121,10 +156,14 @@ def _get_access_token(zoom_oauth_connection) -> str:
         # IMPORTANT: Zoom rotates refresh tokens. Save the new one if provided.
         new_refresh = token_data.get("refresh_token")
         if new_refresh and new_refresh != refresh_token:
-            credentials["refresh_token"] = new_refresh
-            zoom_oauth_connection.set_credentials(credentials)
+            with transaction.atomic():
+                current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
+                current_credentials = current.get_credentials() or {}
+                current_credentials["refresh_token"] = new_refresh
+                current.set_credentials(current_credentials)
             logger.info("Stored rotated Zoom refresh_token for zoom oauth connection %s", zoom_oauth_connection.object_id)
 
+        _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         return access_token
 
     except requests.RequestException as e:
@@ -195,53 +234,57 @@ def _get_zoom_meetings(access_token: str) -> list[dict]:
 
 
 def _upsert_zoom_meeting_to_zoom_oauth_connection_mapping(zoom_meeting_ids: list[int], zoom_oauth_connection: ZoomOAuthConnection):
-    zoom_oauth_app = zoom_oauth_connection.zoom_oauth_app
     num_updated = 0
     num_created = 0
 
-    # Iterate over the zoom meetings and upsert the zoom meeting to zoom oauth connection mapping
-    for zoom_meeting_id in zoom_meeting_ids:
-        if not zoom_meeting_id:
-            logger.warning(f"Zoom meeting id is None for zoom oauth connection {zoom_oauth_connection.id}")
-            continue
+    with transaction.atomic():
+        current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
+        zoom_oauth_app = current.zoom_oauth_app
+        # Hold the connection row lock for all mapping writes. Removal therefore
+        # linearizes either before this block (and rejects it) or after it.
+        for zoom_meeting_id in zoom_meeting_ids:
+            if not zoom_meeting_id:
+                logger.warning(f"Zoom meeting id is None for zoom oauth connection {zoom_oauth_connection.id}")
+                continue
 
-        zoom_meeting_to_zoom_oauth_connection_mapping, created = ZoomMeetingToZoomOAuthConnectionMapping.objects.update_or_create(
-            zoom_oauth_app=zoom_oauth_app,
-            meeting_id=zoom_meeting_id,
-            defaults={"zoom_oauth_connection": zoom_oauth_connection},
-        )
-        # If one already exists, but it has a different zoom_oauth_connection_id, update it
-        if not created and zoom_meeting_to_zoom_oauth_connection_mapping.zoom_oauth_connection_id != zoom_oauth_connection.id:
-            zoom_meeting_to_zoom_oauth_connection_mapping.zoom_oauth_connection = zoom_oauth_connection
-            zoom_meeting_to_zoom_oauth_connection_mapping.save()
-            num_updated += 1
-        if created:
-            num_created += 1
+            zoom_meeting_to_zoom_oauth_connection_mapping, created = ZoomMeetingToZoomOAuthConnectionMapping.objects.update_or_create(
+                zoom_oauth_app=zoom_oauth_app,
+                meeting_id=zoom_meeting_id,
+                defaults={"zoom_oauth_connection": current},
+            )
+            if not created and zoom_meeting_to_zoom_oauth_connection_mapping.zoom_oauth_connection_id != current.id:
+                zoom_meeting_to_zoom_oauth_connection_mapping.zoom_oauth_connection = current
+                zoom_meeting_to_zoom_oauth_connection_mapping.save()
+                num_updated += 1
+            if created:
+                num_created += 1
 
     logger.info(f"Upserted {num_updated} zoom meeting ids to zoom oauth connection mappings and created {num_created} new ones for zoom oauth connection {zoom_oauth_connection.id}")
 
 
 def _handle_zoom_api_authentication_error(zoom_oauth_connection: ZoomOAuthConnection, e: ZoomAPIAuthenticationError):
-    if zoom_oauth_connection.state == ZoomOAuthConnectionStates.DISCONNECTED:
-        logger.info(f"Zoom OAuth connection {zoom_oauth_connection.id} is already in state DISCONNECTED, skipping authentication error handling")
+    try:
+        with transaction.atomic():
+            current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
+            if current.state == ZoomOAuthConnectionStates.DISCONNECTED:
+                logger.info(f"Zoom OAuth connection {zoom_oauth_connection.id} is already in state DISCONNECTED, skipping authentication error handling")
+                return
+            current.state = ZoomOAuthConnectionStates.DISCONNECTED
+            current.connection_failure_data = {
+                "error": str(e),
+                "timestamp": timezone.now().isoformat(),
+            }
+            current.save(update_fields=["state", "connection_failure_data", "updated_at"])
+    except ZoomOAuthConnectionRemovalFenced:
         return
-
-    # Update zoom oauth connection state to indicate failure
-    with transaction.atomic():
-        zoom_oauth_connection.state = ZoomOAuthConnectionStates.DISCONNECTED
-        zoom_oauth_connection.connection_failure_data = {
-            "error": str(e),
-            "timestamp": timezone.now().isoformat(),
-        }
-        zoom_oauth_connection.save()
 
     logger.exception(f"Zoom OAuth connection sync failed with ZoomAPIAuthenticationError for {zoom_oauth_connection.id}: {e}")
 
     # Create webhook event
     trigger_webhook(
         webhook_trigger_type=WebhookTriggerTypes.ZOOM_OAUTH_CONNECTION_STATE_CHANGE,
-        zoom_oauth_connection=zoom_oauth_connection,
-        payload=zoom_oauth_connection_webhook_payload(zoom_oauth_connection),
+        zoom_oauth_connection=current,
+        payload=zoom_oauth_connection_webhook_payload(current),
     )
 
 
@@ -271,6 +314,7 @@ def get_local_recording_token_via_zoom_oauth_app(bot: Bot) -> str | None:
 
     try:
         access_token = _get_access_token(zoom_oauth_connection)
+        _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         local_recording_token = _get_local_recording_token(meeting_id, access_token)
         return local_recording_token
 
@@ -342,6 +386,7 @@ def _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot: Bot) -> tuple
 
     try:
         access_token = _get_access_token(zoom_oauth_connection)
+        _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         onbehalf_token = _get_onbehalf_token(meeting_id, access_token)
         if not onbehalf_token:
             return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_RETURNED_NO_TOKEN

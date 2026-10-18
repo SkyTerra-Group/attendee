@@ -477,6 +477,7 @@ class BotPodCreator:
 
             return {
                 "name": bot_pod_api_response.metadata.name,
+                "uid": str(bot_pod_api_response.metadata.uid),
                 "status": bot_pod_api_response.status.phase,
                 "created": True,
                 "image": self.image,

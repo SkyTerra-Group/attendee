@@ -108,11 +108,14 @@ def create_zoom_oauth_connection(data, project):
 
     try:
         with transaction.atomic():
-            zoom_oauth_connection, created = ZoomOAuthConnection.objects.get_or_create(zoom_oauth_app=zoom_oauth_app, user_id=user_info["id"])
-
-            # Set encrypted credentials (refresh_token)
-            credentials = {"refresh_token": zoom_oauth_tokens["refresh_token"]}
-            zoom_oauth_connection.set_credentials(credentials)
+            zoom_oauth_connection = ZoomOAuthConnection.objects.select_for_update().filter(zoom_oauth_app=zoom_oauth_app, user_id=user_info["id"]).first()
+            created = zoom_oauth_connection is None
+            if created:
+                zoom_oauth_connection = ZoomOAuthConnection.objects.create(
+                    zoom_oauth_app=zoom_oauth_app,
+                    user_id=user_info["id"],
+                    account_id=user_info["account_id"],
+                )
 
             zoom_oauth_connection.account_id = user_info["account_id"]
             zoom_oauth_connection.metadata = validated_data["metadata"]
@@ -125,8 +128,14 @@ def create_zoom_oauth_connection(data, project):
             zoom_oauth_connection.state = ZoomOAuthConnectionStates.CONNECTED
             zoom_oauth_connection.connection_failure_data = None
 
-            # Save the zoom oauth connection
-            zoom_oauth_connection.save()
+            credentials = {"refresh_token": zoom_oauth_tokens["refresh_token"]}
+            if created:
+                zoom_oauth_connection.set_credentials(credentials)
+            else:
+                # A real authorization-code exchange is the trust boundary for
+                # a new grant. Advance its generation atomically so an older
+                # ambiguous removal cannot delete or rewrite it.
+                zoom_oauth_connection.replace_authorization_credentials(credentials)
 
             return zoom_oauth_connection, None
 

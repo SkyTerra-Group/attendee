@@ -20,6 +20,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import F
 from django.utils import timezone
 
+from bots.bot_runtime_fence import confirm_bot_runtime_absence
 from bots.models import (
     AsyncTranscription,
     AudioChunk,
@@ -56,6 +57,7 @@ PROVIDER_TIMEOUT_SECONDS = 30
 LEASE_SECONDS = 300
 RECEIPT_RETENTION_DAYS = 30
 MAX_PURGE_TARGETS = 100
+PENDING_REVOKE_ACCESS_TOKEN_KEY = "_zoom_retention_pending_revoke_access_token"
 
 _COMPLETED_STATES = {
     ZoomRemovalOperationStates.REVOKED,
@@ -81,6 +83,10 @@ class DatabaseVerificationError(Exception):
 
 
 class LeaseLost(Exception):
+    pass
+
+
+class UntrustedDeauthorizationSource(Exception):
     pass
 
 
@@ -136,6 +142,7 @@ def _get_or_create_operation(
     operation_type: str,
     target_object_id: str,
     source: str | None = None,
+    target_generation: uuid.UUID | None = None,
 ) -> ZoomRemovalOperation:
     digest = target_digest(project, operation_type, target_object_id)
 
@@ -143,9 +150,8 @@ def _get_or_create_operation(
     if existing:
         if existing.operation_type != operation_type or existing.target_digest != digest:
             raise OperationConflict()
-        if source == ZoomRemovalOperationSources.ZOOM_DEAUTHORIZATION and existing.source != source:
-            existing.source = source
-            existing.save(update_fields=["source", "updated_at"])
+        if target_generation and existing.target_generation and existing.target_generation != target_generation:
+            raise OperationConflict()
         return existing
 
     existing_target = ZoomRemovalOperation.objects.filter(project=project, operation_type=operation_type, target_digest=digest).first()
@@ -161,6 +167,7 @@ def _get_or_create_operation(
                 source=source,
                 target_digest=digest,
                 target_object_id=target_object_id,
+                target_generation=target_generation,
             )
     except IntegrityError:
         existing = ZoomRemovalOperation.objects.filter(project=project, operation_id=operation_id).first()
@@ -255,31 +262,20 @@ def _safe_json(response):
     return payload if isinstance(payload, dict) else None
 
 
-def _is_explicitly_revoked_or_expired(payload: dict | None) -> bool:
-    if not payload:
-        return False
-    if payload.get("code") == 4741:
-        return True
-    safe_fields = ("error", "error_description", "reason", "message")
-    text = " ".join(str(payload.get(field, "")) for field in safe_fields).lower()
-    if "not revoked" in text or "not expired" in text:
-        return False
-    terminal_phrases = (
-        "token revoked",
-        "token has been revoked",
-        "token is revoked",
-        "token expired",
-        "token has expired",
-        "token is expired",
-        "already revoked",
-        "already expired",
-    )
-    return any(phrase in text for phrase in terminal_phrases)
+def _is_documented_terminal_revoke_response(status_code: int, payload: dict | None) -> bool:
+    """Recognize only Zoom's stable revoke-endpoint code/schema allowlist."""
+
+    return status_code == 400 and isinstance(payload, dict) and type(payload.get("code")) is int and payload.get("code") == 4741 and isinstance(payload.get("message"), str)
 
 
 def _refresh_access_token_for_revoke(connection: ZoomOAuthConnection) -> tuple[str | None, ProviderOutcome | None]:
     try:
         credentials = connection.get_credentials() or {}
+        if not isinstance(credentials, dict):
+            return None, ProviderOutcome(False, "credentials_unavailable")
+        pending_access_token = credentials.get(PENDING_REVOKE_ACCESS_TOKEN_KEY)
+        if isinstance(pending_access_token, str) and pending_access_token:
+            return pending_access_token, None
         refresh_token = credentials.get("refresh_token")
         client_id = connection.zoom_oauth_app.client_id
         client_secret = connection.zoom_oauth_app.client_secret
@@ -299,29 +295,31 @@ def _refresh_access_token_for_revoke(connection: ZoomOAuthConnection) -> tuple[s
     except requests.RequestException:
         return None, ProviderOutcome(False, "refresh_transport_unknown")
 
+    if response.status_code == 429:
+        return None, ProviderOutcome(False, "refresh_rate_limited")
+    if response.status_code >= 500:
+        return None, ProviderOutcome(False, "refresh_provider_unavailable")
     payload = _safe_json(response)
     if payload is None:
         return None, ProviderOutcome(False, "refresh_malformed_response")
     if response.status_code != 200:
-        if _is_explicitly_revoked_or_expired(payload):
-            return None, ProviderOutcome(True, "already_revoked_or_expired")
-        if response.status_code == 429:
-            return None, ProviderOutcome(False, "refresh_rate_limited")
-        if response.status_code >= 500:
-            return None, ProviderOutcome(False, "refresh_provider_unavailable")
         return None, ProviderOutcome(False, "refresh_unrecognized_response")
 
     access_token = payload.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         return None, ProviderOutcome(False, "refresh_missing_access_token")
 
+    credentials[PENDING_REVOKE_ACCESS_TOKEN_KEY] = access_token
     rotated_refresh = payload.get("refresh_token")
-    if isinstance(rotated_refresh, str) and rotated_refresh and rotated_refresh != refresh_token:
+    if isinstance(rotated_refresh, str) and rotated_refresh:
         credentials["refresh_token"] = rotated_refresh
-        try:
-            connection.set_credentials(credentials)
-        except Exception:
-            return None, ProviderOutcome(False, "refresh_persist_failed")
+    try:
+        # Persist the exact revoke credential before the provider call. A lost
+        # response can then replay the identical request without guessing from
+        # a later generic refresh failure.
+        connection.set_credentials(credentials)
+    except Exception:
+        return None, ProviderOutcome(False, "refresh_persist_failed")
 
     return access_token, None
 
@@ -341,17 +339,17 @@ def _revoke_at_zoom(connection: ZoomOAuthConnection) -> ProviderOutcome:
     except requests.RequestException:
         return ProviderOutcome(False, "revoke_transport_unknown")
 
+    if response.status_code == 429:
+        return ProviderOutcome(False, "revoke_rate_limited")
+    if response.status_code >= 500:
+        return ProviderOutcome(False, "revoke_provider_unavailable")
     payload = _safe_json(response)
     if payload is None:
         return ProviderOutcome(False, "revoke_malformed_response")
     if response.status_code == 200 and payload.get("status") == "success":
         return ProviderOutcome(True)
-    if _is_explicitly_revoked_or_expired(payload):
+    if _is_documented_terminal_revoke_response(response.status_code, payload):
         return ProviderOutcome(True, "already_revoked_or_expired")
-    if response.status_code == 429:
-        return ProviderOutcome(False, "revoke_rate_limited")
-    if response.status_code >= 500:
-        return ProviderOutcome(False, "revoke_provider_unavailable")
     return ProviderOutcome(False, "revoke_unrecognized_response")
 
 
@@ -362,8 +360,18 @@ def process_connection_revoke(
     connection_object_id: str,
     source: str,
 ) -> ZoomRemovalOperation:
+    if source != ZoomRemovalOperationSources.SKYTERRA_INITIATED:
+        # A normal project API credential cannot attest a signed Zoom event.
+        # A purpose-bound cross-service trust protocol is intentionally not
+        # invented in this default-off S1 change.
+        raise UntrustedDeauthorizationSource()
     if _target_exists_in_other_project(ZoomOAuthConnection, project, connection_object_id, "zoom_oauth_app__project"):
         raise CrossProjectTarget()
+
+    initial_connection = ZoomOAuthConnection.objects.filter(
+        object_id=connection_object_id,
+        zoom_oauth_app__project=project,
+    ).first()
 
     operation = _get_or_create_operation(
         project=project,
@@ -371,6 +379,7 @@ def process_connection_revoke(
         operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION,
         target_object_id=connection_object_id,
         source=source,
+        target_generation=initial_connection.authorization_generation if initial_connection else None,
     )
     operation, lease_token = _claim_operation(operation)
     if lease_token is None:
@@ -381,16 +390,24 @@ def process_connection_revoke(
         return _release_claim(operation.pk, lease_token, state=ZoomRemovalOperationStates.NOT_FOUND_UNPROVED, failure_code="connection_absence_unproved")
 
     try:
-        if connection.state != ZoomOAuthConnectionStates.DISCONNECTED:
-            ZoomOAuthConnection.objects.filter(pk=connection.pk).update(state=ZoomOAuthConnectionStates.DISCONNECTED)
-            connection.state = ZoomOAuthConnectionStates.DISCONNECTED
+        with transaction.atomic():
+            claimed = ZoomRemovalOperation.objects.select_for_update().get(pk=operation.pk)
+            if claimed.lease_token != lease_token:
+                raise LeaseLost()
+            locked_connection = ZoomOAuthConnection.objects.select_for_update().select_related("zoom_oauth_app").filter(pk=connection.pk, zoom_oauth_app__project=project).first()
+            if locked_connection is None:
+                raise DatabaseVerificationError()
+            if claimed.target_generation and claimed.target_generation != locked_connection.authorization_generation:
+                raise DatabaseVerificationError()
+            if claimed.target_generation is None:
+                claimed.target_generation = locked_connection.authorization_generation
+                claimed.save(update_fields=["target_generation", "updated_at"])
+            if locked_connection.state != ZoomOAuthConnectionStates.REMOVING:
+                locked_connection.state = ZoomOAuthConnectionStates.REMOVING
+                locked_connection.save(update_fields=["state", "updated_at"])
+            connection = locked_connection
 
-        # A verified deauthorization can upgrade a previously initiated revoke,
-        # but a later caller cannot downgrade it back to a provider call.
-        if operation.source == ZoomRemovalOperationSources.ZOOM_DEAUTHORIZATION:
-            provider_outcome = ProviderOutcome(True)
-        else:
-            provider_outcome = _revoke_at_zoom(connection)
+        provider_outcome = _revoke_at_zoom(connection)
 
         if not provider_outcome.terminal:
             return _release_claim(
@@ -405,7 +422,16 @@ def process_connection_revoke(
             claimed = ZoomRemovalOperation.objects.select_for_update().get(pk=operation.pk)
             if claimed.lease_token != lease_token:
                 raise LeaseLost()
-            locked_connection = ZoomOAuthConnection.objects.select_for_update().filter(pk=connection.pk, zoom_oauth_app__project=project).first()
+            locked_connection = (
+                ZoomOAuthConnection.objects.select_for_update()
+                .filter(
+                    pk=connection.pk,
+                    zoom_oauth_app__project=project,
+                    authorization_generation=claimed.target_generation,
+                    state=ZoomOAuthConnectionStates.REMOVING,
+                )
+                .first()
+            )
             if locked_connection is None:
                 raise DatabaseVerificationError()
             WebhookDeliveryAttempt.objects.filter(zoom_oauth_connection=locked_connection).delete()
@@ -487,6 +513,8 @@ def _delete_bot_dependents_and_row(
         if operation.lease_token != lease_token:
             raise LeaseLost()
         locked_bot = Bot.objects.select_for_update().get(pk=bot_pk)
+        if locked_bot.removal_requested_at is None or locked_bot.runtime_absence_confirmed_at is None or locked_bot.runtime_absence_generation != locked_bot.runtime_generation or operation.target_generation != locked_bot.runtime_generation:
+            raise DatabaseVerificationError()
         WebhookDeliveryAttempt.objects.filter(bot_id=bot_pk).delete()
         WebhookSubscription.objects.filter(bot_id=bot_pk).delete()
         BotChatMessageRequest.objects.filter(bot_id=bot_pk).delete()
@@ -528,6 +556,29 @@ def _database_absence_is_verified(project: Project, target_object_id: str) -> bo
     return not Bot.objects.filter(project=project, object_id=target_object_id).exists()
 
 
+def _fence_bot_for_removal(bot: Bot, operation_id: int, lease_token: uuid.UUID) -> Bot:
+    with transaction.atomic():
+        operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
+        if operation.lease_token != lease_token:
+            raise LeaseLost()
+        locked_bot = Bot.objects.select_for_update().get(pk=bot.pk)
+        if operation.target_generation and operation.target_generation != locked_bot.runtime_generation:
+            raise DatabaseVerificationError()
+        if operation.target_generation is None:
+            operation.target_generation = locked_bot.runtime_generation
+            operation.save(update_fields=["target_generation", "updated_at"])
+        if locked_bot.removal_requested_at is None:
+            locked_bot.removal_requested_at = timezone.now()
+            locked_bot.save(update_fields=["removal_requested_at", "updated_at"])
+        return locked_bot
+
+
+def _bot_is_purgeable_state(bot: Bot) -> bool:
+    if bot.state in BotStates.post_meeting_states():
+        return True
+    return bot.state in {BotStates.SCHEDULED, BotStates.STAGED} and bot.runtime_launch_started_at is None
+
+
 def process_bot_purge(*, project: Project, operation_id: uuid.UUID, bot_object_id: str) -> ZoomRemovalOperation:
     if _target_exists_in_other_project(Bot, project, bot_object_id, "project"):
         raise CrossProjectTarget()
@@ -548,8 +599,18 @@ def process_bot_purge(*, project: Project, operation_id: uuid.UUID, bot_object_i
             bot = Bot.objects.filter(project=project, object_id=bot_object_id).first()
             if bot is None:
                 return _release_claim(operation.pk, lease_token, state=ZoomRemovalOperationStates.NOT_FOUND_UNPROVED, failure_code="bot_absence_unproved")
-            if bot.state not in BotStates.post_meeting_states():
+            bot = _fence_bot_for_removal(bot, operation.pk, lease_token)
+            if not _bot_is_purgeable_state(bot):
                 return _release_claim(operation.pk, lease_token, state=ZoomRemovalOperationStates.PENDING_ACTIVE, failure_code="bot_active")
+            if bot.runtime_absence_generation != bot.runtime_generation or bot.runtime_absence_confirmed_at is None:
+                bot = confirm_bot_runtime_absence(bot.pk)
+                if bot is None:
+                    return _release_claim(
+                        operation.pk,
+                        lease_token,
+                        state=ZoomRemovalOperationStates.PENDING_ACTIVE,
+                        failure_code="runtime_absence_unproved",
+                    )
 
         if operation.phase == ZoomRemovalOperationPhases.PENDING:
             manifest = operation.storage_manifest or _storage_manifest(bot)
@@ -566,7 +627,7 @@ def process_bot_purge(*, project: Project, operation_id: uuid.UUID, bot_object_i
 
         if operation.phase == ZoomRemovalOperationPhases.STORAGE_VERIFIED:
             bot = Bot.objects.get(project=project, object_id=bot_object_id)
-            if bot.state == BotStates.DATA_DELETED:
+            if bot.state in {BotStates.DATA_DELETED, BotStates.SCHEDULED, BotStates.STAGED}:
                 bot.ensure_data_deleted()
             else:
                 bot.delete_data()

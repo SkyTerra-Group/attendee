@@ -195,7 +195,12 @@ class Command(BaseCommand):
         join_at_jitter_threshold = timezone.now() + timezone.timedelta(seconds=jitter_start_seconds)
 
         with transaction.atomic():
-            bots_to_launch = Bot.objects.filter(state=BotStates.SCHEDULED, join_at__lte=join_at_upper_threshold, join_at__gte=join_at_lower_threshold).select_for_update(skip_locked=True)
+            bots_to_launch = Bot.objects.filter(
+                state=BotStates.SCHEDULED,
+                join_at__lte=join_at_upper_threshold,
+                join_at__gte=join_at_lower_threshold,
+                removal_requested_at__isnull=True,
+            ).select_for_update(skip_locked=True)
 
             num_bots_launched = 0
             for bot in bots_to_launch:
@@ -252,7 +257,12 @@ class Command(BaseCommand):
         join_at_lower_threshold = timezone.now() - timezone.timedelta(minutes=5)
 
         with transaction.atomic():
-            bots_to_launch = Bot.objects.filter(state=BotStates.SCHEDULED, join_at__lte=join_at_upper_threshold, join_at__gte=join_at_lower_threshold).select_for_update(skip_locked=True)
+            bots_to_launch = Bot.objects.filter(
+                state=BotStates.SCHEDULED,
+                join_at__lte=join_at_upper_threshold,
+                join_at__gte=join_at_lower_threshold,
+                removal_requested_at__isnull=True,
+            ).select_for_update(skip_locked=True)
 
             for bot in bots_to_launch:
                 log.info(f"Launching scheduled bot {bot.id} ({bot.object_id}) with join_at {bot.join_at.isoformat()}")

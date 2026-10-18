@@ -3,13 +3,17 @@ import json
 import logging
 import threading
 import uuid
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import requests
+from concurrency.exceptions import RecordModifiedError
+from django.core.exceptions import ValidationError
 from django.db import close_old_connections
 from django.test import Client, TransactionTestCase, override_settings
 from django.utils import timezone
 
+from bots.bot_runtime_fence import bot_runtime_is_absent
 from bots.models import (
     ApiKey,
     AsyncTranscription,
@@ -41,17 +45,28 @@ from bots.models import (
     ZoomMeetingToZoomOAuthConnectionMapping,
     ZoomOAuthApp,
     ZoomOAuthConnection,
+    ZoomOAuthConnectionStates,
     ZoomRemovalOperation,
     ZoomRemovalOperationPhases,
     ZoomRemovalOperationSources,
     ZoomRemovalOperationStates,
 )
+from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
+from bots.tasks.refresh_zoom_oauth_connection_task import refresh_zoom_oauth_connection
+from bots.tasks.sync_zoom_oauth_connection_task import sync_zoom_oauth_connection
+from bots.tasks.validate_zoom_oauth_connections_task import validate_zoom_oauth_connections
+from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
+from bots.zoom_oauth_connections_utils import ZoomOAuthConnectionRemovalFenced, _get_access_token
 from bots.zoom_retention import (
     DatabaseVerificationError,
+    OperationConflict,
+    ProviderOutcome,
     StorageVerificationError,
     _delete_and_verify_storage,
+    _revoke_at_zoom,
     delete_expired_receipts,
     process_bot_purge,
+    process_connection_revoke,
 )
 
 
@@ -104,8 +119,11 @@ class ZoomRetentionTests(TransactionTestCase):
 
         self.webhook_patch = patch("bots.models.trigger_webhook", return_value=0)
         self.webhook_patch.start()
+        self.runtime_absence_patch = patch("bots.bot_runtime_fence.bot_runtime_is_absent", return_value=True)
+        self.runtime_absence = self.runtime_absence_patch.start()
 
     def tearDown(self):
+        self.runtime_absence_patch.stop()
         self.webhook_patch.stop()
 
     def post(self, url, payload, api_key=None):
@@ -129,6 +147,15 @@ class ZoomRetentionTests(TransactionTestCase):
     def make_bot(self, *, state=BotStates.ENDED, other=False, name="Target"):
         project = self.other_project if other else self.project
         return Bot.objects.create(project=project, name=name, meeting_url="https://zoom.us/j/123456789", state=state)
+
+    def ambiguously_fence_connection(self, connection):
+        with patch("bots.zoom_retention._revoke_at_zoom", return_value=ProviderOutcome(False, "revoke_transport_unknown")):
+            return process_connection_revoke(
+                project=self.project,
+                operation_id=uuid.uuid4(),
+                connection_object_id=connection.object_id,
+                source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            )
 
     def revoke_payload(self, connection, operation_id=None, source=ZoomRemovalOperationSources.SKYTERRA_INITIATED, project=None):
         return {
@@ -181,7 +208,6 @@ class ZoomRetentionTests(TransactionTestCase):
     def test_ambiguous_network_revoke_is_not_success_and_keeps_credentials(self, post):
         marker = "ambiguous-secret-never-log"
         connection = self.make_connection(refresh_token=marker)
-        encrypted_before = bytes(connection._encrypted_data)
         post.side_effect = [
             response(200, {"access_token": marker}),
             requests.Timeout(marker),
@@ -196,26 +222,32 @@ class ZoomRetentionTests(TransactionTestCase):
 
         self.assertEqual(result.json()["state"], ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         connection.refresh_from_db()
-        self.assertEqual(bytes(connection._encrypted_data), encrypted_before)
-        self.assertEqual(connection.state, 2)
+        self.assertEqual(connection.get_credentials()["_zoom_retention_pending_revoke_access_token"], marker)
+        self.assertEqual(connection.state, ZoomOAuthConnectionStates.REMOVING)
         self.assertNotIn(marker, result.content.decode() + stream.getvalue())
 
     @patch("bots.zoom_retention.requests.post")
     def test_explicit_already_revoked_is_terminal_but_unrecognized_4xx_is_retryable(self, post):
         terminal = self.make_connection(refresh_token="terminal-refresh")
-        post.return_value = response(400, {"code": 4741, "message": "token revoked"})
+        post.side_effect = [
+            response(200, {"access_token": "terminal-access"}),
+            response(400, {"code": 4741, "message": "token revoked"}),
+        ]
         terminal_result = self.post("/api/v1/zoom_retention/revoke", self.revoke_payload(terminal))
         self.assertEqual(terminal_result.json()["state"], ZoomRemovalOperationStates.REVOKED)
         self.assertFalse(ZoomOAuthConnection.objects.filter(pk=terminal.pk).exists())
 
         retryable = self.make_connection(refresh_token="retryable-refresh")
-        post.return_value = response(400, {"error": "invalid_grant"})
+        post.side_effect = [
+            response(200, {"access_token": "retryable-access"}),
+            response(400, {"error": "invalid_grant"}),
+        ]
         retryable_result = self.post("/api/v1/zoom_retention/revoke", self.revoke_payload(retryable))
         self.assertEqual(retryable_result.json()["state"], ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         self.assertTrue(ZoomOAuthConnection.objects.filter(pk=retryable.pk).exists())
 
     @patch("bots.zoom_retention.requests.post")
-    def test_signed_zoom_deauthorization_deletes_locally_without_provider_call(self, post):
+    def test_generic_project_caller_cannot_assert_zoom_deauthorization(self, post):
         connection = self.make_connection()
         mapping = ZoomMeetingToZoomOAuthConnectionMapping.objects.create(
             zoom_oauth_connection=connection,
@@ -234,15 +266,15 @@ class ZoomRetentionTests(TransactionTestCase):
             "/api/v1/zoom_retention/revoke",
             self.revoke_payload(connection, source=ZoomRemovalOperationSources.ZOOM_DEAUTHORIZATION),
         )
-        self.assertEqual(result.json()["state"], ZoomRemovalOperationStates.REVOKED)
-        self.assertFalse(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
-        self.assertFalse(ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(pk=mapping.pk).exists())
-        self.assertFalse(WebhookDeliveryAttempt.objects.filter(pk=delivery_attempt.pk).exists())
-        self.assertTrue(WebhookSubscription.objects.filter(pk=global_subscription.pk).exists())
+        self.assertEqual(result.status_code, 400)
+        self.assertTrue(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
+        self.assertTrue(ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(pk=mapping.pk).exists())
+        self.assertTrue(WebhookDeliveryAttempt.objects.filter(pk=delivery_attempt.pk).exists())
+        self.assertFalse(ZoomRemovalOperation.objects.exists())
         post.assert_not_called()
 
     @patch("bots.zoom_retention.requests.post")
-    def test_signed_deauthorization_settles_same_operation_after_ambiguous_revoke(self, post):
+    def test_untrusted_deauthorization_cannot_upgrade_ambiguous_operation(self, post):
         connection = self.make_connection()
         operation_id = uuid.uuid4()
         post.side_effect = [response(200, {"access_token": "ephemeral-access"}), requests.Timeout()]
@@ -255,9 +287,104 @@ class ZoomRetentionTests(TransactionTestCase):
             "/api/v1/zoom_retention/revoke",
             self.revoke_payload(connection, operation_id, source=ZoomRemovalOperationSources.ZOOM_DEAUTHORIZATION),
         )
-        self.assertEqual(second.json()["state"], ZoomRemovalOperationStates.REVOKED)
-        self.assertFalse(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
+        self.assertEqual(second.status_code, 400)
+        self.assertTrue(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
+        operation = ZoomRemovalOperation.objects.get(operation_id=operation_id)
+        self.assertEqual(operation.source, ZoomRemovalOperationSources.SKYTERRA_INITIATED)
+        self.assertEqual(operation.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         post.assert_not_called()
+
+    @patch("bots.zoom_retention.requests.post")
+    def test_rate_limits_provider_errors_and_free_text_never_prove_revocation(self, post):
+        cases = [
+            (429, {"code": 4741, "message": "token revoked"}, "revoke_rate_limited"),
+            (500, {"code": 4741, "message": "token expired"}, "revoke_provider_unavailable"),
+            (503, {"message": "already revoked"}, "revoke_provider_unavailable"),
+            (400, {"code": "4741", "message": "token revoked"}, "revoke_unrecognized_response"),
+            (401, {"code": 4741, "message": "token revoked"}, "revoke_unrecognized_response"),
+        ]
+        for status_code, payload, failure_code in cases:
+            with self.subTest(status_code=status_code, payload=payload):
+                connection = self.make_connection()
+                post.side_effect = [response(200, {"access_token": "exact-replay-token"}), response(status_code, payload)]
+                outcome = _revoke_at_zoom(connection)
+                self.assertFalse(outcome.terminal)
+                self.assertEqual(outcome.failure_code, failure_code)
+                self.assertTrue(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
+
+    @patch("bots.zoom_retention.requests.post")
+    def test_refresh_rate_limit_provider_error_and_malformed_body_stay_unknown(self, post):
+        malformed = response(200, {})
+        malformed.json.side_effect = ValueError("malformed")
+        cases = [
+            response(429, {"code": 4741, "message": "token expired"}),
+            response(503, {"code": 4741, "message": "already revoked"}),
+            malformed,
+        ]
+        for provider_response in cases:
+            with self.subTest(status_code=provider_response.status_code):
+                connection = self.make_connection()
+                post.side_effect = [provider_response]
+                outcome = _revoke_at_zoom(connection)
+                self.assertFalse(outcome.terminal)
+                self.assertTrue(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
+
+    @patch("bots.zoom_retention.requests.post")
+    def test_lost_revoke_success_replays_exact_encrypted_access_token(self, post):
+        access_token = "lost-success-exact-token-never-log"
+        connection = self.make_connection()
+        operation_id = uuid.uuid4()
+        post.side_effect = [response(200, {"access_token": access_token}), requests.Timeout("response lost")]
+
+        first = process_connection_revoke(
+            project=self.project,
+            operation_id=operation_id,
+            connection_object_id=connection.object_id,
+            source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+        )
+        self.assertEqual(first.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
+        connection.refresh_from_db()
+        self.assertEqual(connection.get_credentials()["_zoom_retention_pending_revoke_access_token"], access_token)
+
+        post.reset_mock()
+        post.side_effect = None
+        post.return_value = response(400, {"code": 4741, "message": "token revoked"})
+        second = process_connection_revoke(
+            project=self.project,
+            operation_id=operation_id,
+            connection_object_id=connection.object_id,
+            source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+        )
+        self.assertEqual(second.state, ZoomRemovalOperationStates.REVOKED)
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["data"]["token"], access_token)
+
+    @patch("bots.zoom_retention.requests.post")
+    def test_lost_revoke_without_exact_terminal_proof_retains_replay_token(self, post):
+        access_token = "unproved-exact-token-never-log"
+        connection = self.make_connection()
+        operation_id = uuid.uuid4()
+        post.side_effect = [response(200, {"access_token": access_token}), requests.Timeout("response lost")]
+        process_connection_revoke(
+            project=self.project,
+            operation_id=operation_id,
+            connection_object_id=connection.object_id,
+            source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+        )
+
+        post.reset_mock()
+        post.side_effect = None
+        post.return_value = response(400, {"error": "invalid_grant"})
+        replay = process_connection_revoke(
+            project=self.project,
+            operation_id=operation_id,
+            connection_object_id=connection.object_id,
+            source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+        )
+        self.assertEqual(replay.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
+        connection.refresh_from_db()
+        self.assertEqual(connection.get_credentials()["_zoom_retention_pending_revoke_access_token"], access_token)
+        post.assert_called_once()
 
     def test_cross_project_revoke_and_purge_create_no_receipt(self):
         foreign_connection = self.make_connection(other=True)
@@ -307,6 +434,233 @@ class ZoomRetentionTests(TransactionTestCase):
         )
         self.assertEqual([item["state"] for item in second.json()["results"]], ["purged", "purged"])
         self.assertEqual(ZoomRemovalOperation.objects.get(operation_id=terminal_operation_id).attempt_count, 1)
+
+    @patch("bots.zoom_retention._delete_and_verify_storage", return_value=None)
+    def test_failed_kubernetes_cleanup_keeps_fatal_bot_pending_then_converges_after_absence(self, storage):
+        bot = self.make_bot(state=BotStates.FATAL_ERROR)
+        bot.runtime_backend = "kubernetes"
+        bot.runtime_launch_started_at = timezone.now()
+        bot.runtime_launch_completed_at = timezone.now()
+        bot.runtime_identifier = "provider-runtime-uid"
+        bot.save()
+        operation_id = uuid.uuid4()
+
+        with patch("bots.bot_runtime_fence.bot_runtime_is_absent", return_value=False):
+            first = process_bot_purge(project=self.project, operation_id=operation_id, bot_object_id=bot.object_id)
+        self.assertEqual(first.state, ZoomRemovalOperationStates.PENDING_ACTIVE)
+        self.assertEqual(first.failure_code, "runtime_absence_unproved")
+        self.assertTrue(Bot.objects.filter(pk=bot.pk).exists())
+        storage.assert_not_called()
+
+        with patch("bots.bot_runtime_fence.bot_runtime_is_absent", return_value=True):
+            second = process_bot_purge(project=self.project, operation_id=operation_id, bot_object_id=bot.object_id)
+        self.assertEqual(second.state, ZoomRemovalOperationStates.PURGED)
+        self.assertFalse(Bot.objects.filter(pk=bot.pk).exists())
+
+    def test_celery_fatal_bot_without_runner_completion_has_no_absence_proof(self):
+        bot = self.make_bot(state=BotStates.FATAL_ERROR)
+        bot.removal_requested_at = timezone.now()
+        bot.runtime_backend = "celery"
+        bot.runtime_launch_started_at = timezone.now()
+        bot.runtime_launch_completed_at = None
+        bot.runtime_launch_in_progress = False
+        bot.save()
+        self.assertFalse(bot_runtime_is_absent(bot))
+
+    def test_failed_kubernetes_delete_cannot_be_mistaken_for_runtime_absence(self):
+        from kubernetes import client as kubernetes_client
+
+        bot = self.make_bot(state=BotStates.FATAL_ERROR)
+        bot.removal_requested_at = timezone.now()
+        bot.runtime_backend = "kubernetes"
+        bot.runtime_identifier = "matching-provider-uid"
+        bot.runtime_launch_started_at = timezone.now()
+        bot.runtime_launch_completed_at = timezone.now()
+        bot.save()
+        pod = Mock(metadata=Mock(uid=bot.runtime_identifier))
+        api = Mock()
+        api.read_namespaced_pod.return_value = pod
+        api.delete_namespaced_pod.side_effect = kubernetes_client.ApiException(status=500)
+        with (
+            patch("kubernetes.config.load_incluster_config"),
+            patch("kubernetes.client.CoreV1Api", return_value=api),
+        ):
+            self.assertFalse(bot_runtime_is_absent(bot))
+        api.delete_namespaced_pod.assert_called_once()
+
+    @patch("bots.zoom_retention._delete_and_verify_storage")
+    def test_scheduled_launch_is_fenced_and_receipt_survives_response_loss(self, storage):
+        bot = self.make_bot(state=BotStates.SCHEDULED)
+        bot.join_at = timezone.now()
+        bot.save()
+        operation_id = uuid.uuid4()
+        entered = threading.Event()
+        release = threading.Event()
+        worker_result = []
+
+        def blocked_storage(_manifest):
+            entered.set()
+            release.wait(timeout=10)
+
+        storage.side_effect = blocked_storage
+
+        def purge_worker():
+            close_old_connections()
+            try:
+                worker_result.append(
+                    process_bot_purge(
+                        project=Project.objects.get(pk=self.project.pk),
+                        operation_id=operation_id,
+                        bot_object_id=bot.object_id,
+                    )
+                )
+            finally:
+                close_old_connections()
+
+        thread = threading.Thread(target=purge_worker)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=10))
+        bot.refresh_from_db()
+        self.assertEqual(bot.runtime_absence_generation, bot.runtime_generation)
+        self.assertIsNotNone(bot.runtime_absence_confirmed_at)
+        with patch("bots.tasks.launch_scheduled_bot_task.launch_bot") as launch:
+            launch_scheduled_bot(bot.pk, bot.join_at.isoformat())
+        launch.assert_not_called()
+        release.set()
+        thread.join(timeout=20)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(worker_result[0].state, ZoomRemovalOperationStates.PURGED)
+
+        replay = process_bot_purge(project=self.project, operation_id=operation_id, bot_object_id=bot.object_id)
+        self.assertEqual(replay.state, ZoomRemovalOperationStates.PURGED)
+        self.assertEqual(replay.attempt_count, 1)
+
+    def test_stale_connection_instance_cannot_restore_connected_state(self):
+        connection = self.make_connection()
+        stale = ZoomOAuthConnection.objects.get(pk=connection.pk)
+        result = self.ambiguously_fence_connection(connection)
+        self.assertEqual(result.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
+
+        stale.state = ZoomOAuthConnectionStates.CONNECTED
+        with self.assertRaises((ValidationError, RecordModifiedError)):
+            stale.save()
+        connection.refresh_from_db()
+        self.assertEqual(connection.state, ZoomOAuthConnectionStates.REMOVING)
+
+    def test_stale_refresh_sync_and_validation_writers_cannot_resurrect_or_map(self):
+        refresh_connection = self.make_connection()
+
+        def fence_refresh(_connection):
+            self.ambiguously_fence_connection(refresh_connection)
+            return "stale-access"
+
+        with patch("bots.tasks.refresh_zoom_oauth_connection_task._get_access_token", side_effect=fence_refresh):
+            refresh_zoom_oauth_connection(refresh_connection.pk)
+        refresh_connection.refresh_from_db()
+        self.assertEqual(refresh_connection.state, ZoomOAuthConnectionStates.REMOVING)
+        self.assertIsNone(refresh_connection.last_successful_token_refresh_at)
+
+        sync_connection = self.make_connection()
+
+        def fence_sync(_connection):
+            self.ambiguously_fence_connection(sync_connection)
+            return "stale-access"
+
+        with (
+            patch("bots.tasks.sync_zoom_oauth_connection_task._get_access_token", side_effect=fence_sync),
+            patch("bots.tasks.sync_zoom_oauth_connection_task._get_zoom_meetings", return_value=[{"id": "987654321"}]) as get_meetings,
+            patch("bots.tasks.sync_zoom_oauth_connection_task._get_zoom_personal_meeting_id", return_value="123456789") as get_personal_meeting,
+        ):
+            sync_zoom_oauth_connection(sync_connection.pk)
+        sync_connection.refresh_from_db()
+        self.assertEqual(sync_connection.state, ZoomOAuthConnectionStates.REMOVING)
+        get_meetings.assert_not_called()
+        get_personal_meeting.assert_not_called()
+        self.assertFalse(ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(zoom_oauth_connection=sync_connection).exists())
+
+        validation_connection = self.make_connection()
+        validation_connection.state = ZoomOAuthConnectionStates.DISCONNECTED
+        validation_connection.connection_failure_data = {"error": "Invalid client_id or client_secret"}
+        validation_connection.save()
+
+        def fence_validation(_connection):
+            self.ambiguously_fence_connection(validation_connection)
+            return "stale-access"
+
+        with patch("bots.tasks.validate_zoom_oauth_connections_task._get_access_token", side_effect=fence_validation):
+            validate_zoom_oauth_connections(self.zoom_app.pk)
+        validation_connection.refresh_from_db()
+        self.assertEqual(validation_connection.state, ZoomOAuthConnectionStates.REMOVING)
+
+    @patch("bots.zoom_oauth_connections_utils.requests.post")
+    def test_token_rotation_cannot_write_after_removal_fence(self, post):
+        connection = self.make_connection(refresh_token="original-refresh")
+        provider_response = response(200, {})
+        provider_response.raise_for_status.return_value = None
+
+        def fence_before_rotation():
+            self.ambiguously_fence_connection(connection)
+            return {"access_token": "stale-access", "refresh_token": "rotated-refresh"}
+
+        provider_response.json.side_effect = fence_before_rotation
+        post.return_value = provider_response
+        with self.assertRaises(ZoomOAuthConnectionRemovalFenced):
+            _get_access_token(connection)
+        connection.refresh_from_db()
+        self.assertEqual(connection.state, ZoomOAuthConnectionStates.REMOVING)
+        self.assertEqual(connection.get_credentials()["refresh_token"], "original-refresh")
+
+    def test_old_removal_generation_cannot_touch_fresh_reconnection(self):
+        old_connection = self.make_connection()
+        operation_id = uuid.uuid4()
+        with patch("bots.zoom_retention._revoke_at_zoom", return_value=ProviderOutcome(False, "revoke_transport_unknown")):
+            first = process_connection_revoke(
+                project=self.project,
+                operation_id=operation_id,
+                connection_object_id=old_connection.object_id,
+                source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            )
+        self.assertEqual(first.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
+        old_generation = old_connection.authorization_generation
+        with (
+            patch(
+                "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens",
+                return_value={
+                    "access_token": "replacement-access",
+                    "refresh_token": "replacement-refresh",
+                    "scope": "user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token",
+                },
+            ),
+            patch(
+                "bots.zoom_oauth_connections_api_utils._get_user_info",
+                return_value={
+                    "id": old_connection.user_id,
+                    "account_id": "replacement-account",
+                    "status": "active",
+                },
+            ),
+        ):
+            replacement, error = create_zoom_oauth_connection(
+                {
+                    "zoom_oauth_app_id": self.zoom_app.object_id,
+                    "authorization_code": "fresh-code",
+                    "redirect_uri": "https://example.com/oauth/callback",
+                },
+                self.project,
+            )
+        self.assertIsNone(error)
+        self.assertEqual(replacement.pk, old_connection.pk)
+        self.assertNotEqual(replacement.authorization_generation, old_generation)
+        with self.assertRaises(OperationConflict):
+            process_connection_revoke(
+                project=self.project,
+                operation_id=operation_id,
+                connection_object_id=replacement.object_id,
+                source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            )
+        replacement.refresh_from_db()
+        self.assertEqual(replacement.state, ZoomOAuthConnectionStates.CONNECTED)
+        self.assertEqual(replacement.get_credentials()["refresh_token"], "replacement-refresh")
 
     @patch("django.db.models.fields.files.FieldFile.delete", autospec=True)
     @patch("bots.zoom_retention._delete_and_verify_storage", return_value=None)
@@ -569,6 +923,52 @@ class ZoomRetentionTests(TransactionTestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(results[0].state, ZoomRemovalOperationStates.PURGED)
         self.assertEqual(ZoomRemovalOperation.objects.get(operation_id=operation_id).attempt_count, 1)
+
+    def test_expired_lease_reclaimer_fences_old_worker_after_over_300_seconds(self):
+        bot = self.make_bot()
+        operation_id = uuid.uuid4()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        calls_lock = threading.Lock()
+        old_results = []
+
+        def storage_step(_manifest):
+            with calls_lock:
+                calls.append(threading.get_ident())
+                call_number = len(calls)
+            if call_number == 1:
+                entered.set()
+                release.wait(timeout=20)
+
+        def old_worker():
+            close_old_connections()
+            try:
+                old_results.append(
+                    process_bot_purge(
+                        project=Project.objects.get(pk=self.project.pk),
+                        operation_id=operation_id,
+                        bot_object_id=bot.object_id,
+                    )
+                )
+            finally:
+                close_old_connections()
+
+        with patch("bots.zoom_retention._delete_and_verify_storage", side_effect=storage_step):
+            thread = threading.Thread(target=old_worker)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=10))
+            ZoomRemovalOperation.objects.filter(project=self.project, operation_id=operation_id).update(lease_expires_at=timezone.now() - timedelta(seconds=1))
+            reclaimed = process_bot_purge(project=self.project, operation_id=operation_id, bot_object_id=bot.object_id)
+            self.assertEqual(reclaimed.state, ZoomRemovalOperationStates.PURGED)
+            release.set()
+            thread.join(timeout=20)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(old_results[0].state, ZoomRemovalOperationStates.PURGED)
+        receipt = ZoomRemovalOperation.objects.get(operation_id=operation_id)
+        self.assertEqual(receipt.attempt_count, 2)
+        self.assertGreaterEqual(len(calls), 3)
 
     def test_completed_receipt_expires_after_bounded_window(self):
         bot = self.make_bot()

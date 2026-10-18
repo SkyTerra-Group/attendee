@@ -67,7 +67,12 @@ def remove_bots_from_calendar(calendar: Calendar, project: Project):
 
     # Bulk delete all scheduled bots for this calendar
     try:
-        deleted_count, _ = Bot.objects.filter(calendar_event__calendar=calendar, state=BotStates.SCHEDULED, project=project).delete()
+        deleted_count, _ = Bot.objects.filter(
+            calendar_event__calendar=calendar,
+            state=BotStates.SCHEDULED,
+            project=project,
+            removal_requested_at__isnull=True,
+        ).delete()
 
         logger.info(f"remove_bots_from_calendar deleted {deleted_count} scheduled bots from calendar {calendar.id}")
     except Exception as e:

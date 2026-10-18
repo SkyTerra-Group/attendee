@@ -1,9 +1,11 @@
 import logging
 import os
+import uuid
 
 import docker
 from celery import shared_task
 
+from bots.bot_runtime_fence import claim_bot_runtime_launch, complete_bot_runtime_launch, runtime_launch_is_allowed
 from bots.models import Bot
 
 logger = logging.getLogger(__name__)
@@ -19,7 +21,7 @@ class BotLauncherCapacityError(Exception):
     retry_backoff=True,
     max_retries=6,
 )
-def run_bot_in_ephemeral_container(self, bot_id: int):
+def run_bot_in_ephemeral_container(self, bot_id: int, runtime_generation=None):
     """
     Launches an ephemeral Docker container to execute a bot.
     Timeout is calculated from bot's max_uptime_seconds + 1h margin.
@@ -28,6 +30,19 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
     Celery task returns in ~2 seconds.
     """
     logger.info(f"Launching ephemeral Docker container for bot {bot_id}")
+
+    if runtime_generation is None:
+        claimed_bot = claim_bot_runtime_launch(bot_id, "docker-compose-multi-host")
+        if claimed_bot is None:
+            return
+        generation = claimed_bot.runtime_generation
+    else:
+        try:
+            generation = uuid.UUID(str(runtime_generation))
+        except (TypeError, ValueError):
+            return
+        if not runtime_launch_is_allowed(bot_id, generation):
+            return
 
     try:
         # Connect to Docker daemon
@@ -124,6 +139,7 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
             security_opt=["seccomp=unconfined"],  # Same config as workers
             # Container will automatically stop after max_execution_seconds thanks to timeout in command
         )
+        complete_bot_runtime_launch(bot_id, generation, runtime_identifier=str(container.id))
 
         # Log container info and how to view logs
         log_instruction = f"View logs with: docker logs -f {container_name}" if not auto_remove else "Container will auto-remove when done. To keep containers, set BOT_CONTAINER_AUTO_REMOVE=false"
@@ -156,11 +172,14 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         }
 
     except docker.errors.ImageNotFound:
+        complete_bot_runtime_launch(bot_id, generation)
         logger.error(f"Image {image} not found. Cannot launch bot {bot_id}")
         raise
     except docker.errors.APIError as e:
+        complete_bot_runtime_launch(bot_id, generation)
         logger.error(f"Docker API error while launching bot {bot_id}: {str(e)}")
         raise
     except Exception as e:
+        complete_bot_runtime_launch(bot_id, generation)
         logger.error(f"Error launching ephemeral container for bot {bot_id}: {str(e)}", exc_info=True)
         raise

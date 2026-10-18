@@ -13,6 +13,7 @@ from .zoom_retention import (
     MAX_PURGE_TARGETS,
     CrossProjectTarget,
     OperationConflict,
+    UntrustedDeauthorizationSource,
     get_project_operation,
     operation_result,
     process_bot_purge,
@@ -59,7 +60,7 @@ class ZoomConnectionRevokeView(GenericAPIView):
         operation_id = _uuid(request.data.get("operation_id"))
         connection_id = request.data.get("connection_id")
         source = request.data.get("source")
-        if operation_id is None or not _valid_target_id(connection_id, "zoc_") or source not in ZoomRemovalOperationSources.values:
+        if operation_id is None or not _valid_target_id(connection_id, "zoc_") or source != ZoomRemovalOperationSources.SKYTERRA_INITIATED:
             return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
@@ -73,6 +74,8 @@ class ZoomConnectionRevokeView(GenericAPIView):
             return Response({"error": "scope_not_found"}, status=status.HTTP_404_NOT_FOUND)
         except OperationConflict as error:
             return _safe_conflict_response(error)
+        except UntrustedDeauthorizationSource:
+            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
         return Response(operation_result(operation), status=status.HTTP_200_OK)
 
 
