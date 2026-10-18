@@ -468,7 +468,17 @@ class ZoomRemovalOperation(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["project", "operation_id"], name="unique_zoom_removal_operation_id_per_project"),
-            models.UniqueConstraint(fields=["project", "operation_type", "target_digest"], name="unique_zoom_removal_target_per_project"),
+            models.UniqueConstraint(
+                fields=["project", "operation_type", "target_digest"],
+                condition=models.Q(operation_type=ZoomRemovalOperationTypes.PURGE_BOT),
+                name="unique_zoom_purge_target_per_project",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "operation_type", "target_digest", "target_generation"],
+                condition=models.Q(operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION),
+                nulls_distinct=False,
+                name="unique_zoom_revoke_target_generation",
+            ),
         ]
         indexes = [
             models.Index(fields=["project", "operation_id"], name="zoom_remove_project_op_idx"),

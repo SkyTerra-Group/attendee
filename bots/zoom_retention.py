@@ -146,15 +146,28 @@ def _get_or_create_operation(
 ) -> ZoomRemovalOperation:
     digest = target_digest(project, operation_type, target_object_id)
 
+    def matches_request(candidate: ZoomRemovalOperation) -> bool:
+        if candidate.operation_type != operation_type or candidate.target_digest != digest:
+            return False
+        if operation_type == ZoomRemovalOperationTypes.REVOKE_CONNECTION and target_generation is not None:
+            return candidate.target_generation == target_generation
+        return True
+
+    target_lookup = {
+        "project": project,
+        "operation_type": operation_type,
+        "target_digest": digest,
+    }
+    if operation_type == ZoomRemovalOperationTypes.REVOKE_CONNECTION:
+        target_lookup["target_generation"] = target_generation
+
     existing = ZoomRemovalOperation.objects.filter(project=project, operation_id=operation_id).first()
     if existing:
-        if existing.operation_type != operation_type or existing.target_digest != digest:
-            raise OperationConflict()
-        if target_generation and existing.target_generation and existing.target_generation != target_generation:
+        if not matches_request(existing):
             raise OperationConflict()
         return existing
 
-    existing_target = ZoomRemovalOperation.objects.filter(project=project, operation_type=operation_type, target_digest=digest).first()
+    existing_target = ZoomRemovalOperation.objects.filter(**target_lookup).first()
     if existing_target:
         raise OperationConflict(existing_target.operation_id)
 
@@ -171,9 +184,9 @@ def _get_or_create_operation(
             )
     except IntegrityError:
         existing = ZoomRemovalOperation.objects.filter(project=project, operation_id=operation_id).first()
-        if existing and existing.operation_type == operation_type and existing.target_digest == digest:
+        if existing and matches_request(existing):
             return existing
-        existing_target = ZoomRemovalOperation.objects.filter(project=project, operation_type=operation_type, target_digest=digest).first()
+        existing_target = ZoomRemovalOperation.objects.filter(**target_lookup).first()
         raise OperationConflict(existing_target.operation_id if existing_target else None)
 
 

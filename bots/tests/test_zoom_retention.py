@@ -610,7 +610,7 @@ class ZoomRetentionTests(TransactionTestCase):
         self.assertEqual(connection.state, ZoomOAuthConnectionStates.REMOVING)
         self.assertEqual(connection.get_credentials()["refresh_token"], "original-refresh")
 
-    def test_old_removal_generation_cannot_touch_fresh_reconnection(self):
+    def test_removal_dedupe_is_generation_scoped_after_fresh_reconnection(self):
         old_connection = self.make_connection()
         operation_id = uuid.uuid4()
         with patch("bots.zoom_retention._revoke_at_zoom", return_value=ProviderOutcome(False, "revoke_transport_unknown")):
@@ -622,6 +622,15 @@ class ZoomRetentionTests(TransactionTestCase):
             )
         self.assertEqual(first.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         old_generation = old_connection.authorization_generation
+        with self.assertRaises(OperationConflict) as duplicate_conflict:
+            process_connection_revoke(
+                project=self.project,
+                operation_id=uuid.uuid4(),
+                connection_object_id=old_connection.object_id,
+                source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            )
+        self.assertEqual(duplicate_conflict.exception.canonical_operation_id, operation_id)
+
         with (
             patch(
                 "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens",
@@ -661,6 +670,22 @@ class ZoomRetentionTests(TransactionTestCase):
         replacement.refresh_from_db()
         self.assertEqual(replacement.state, ZoomOAuthConnectionStates.CONNECTED)
         self.assertEqual(replacement.get_credentials()["refresh_token"], "replacement-refresh")
+
+        fresh_operation_id = uuid.uuid4()
+        with patch("bots.zoom_retention._revoke_at_zoom", return_value=ProviderOutcome(True)):
+            fresh_removal = process_connection_revoke(
+                project=self.project,
+                operation_id=fresh_operation_id,
+                connection_object_id=replacement.object_id,
+                source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            )
+        self.assertEqual(fresh_removal.state, ZoomRemovalOperationStates.REVOKED)
+        self.assertEqual(fresh_removal.target_generation, replacement.authorization_generation)
+        self.assertNotEqual(fresh_removal.target_generation, first.target_generation)
+        self.assertEqual(fresh_removal.target_digest, first.target_digest)
+        self.assertFalse(ZoomOAuthConnection.objects.filter(pk=replacement.pk).exists())
+        first.refresh_from_db()
+        self.assertEqual(first.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
 
     @patch("django.db.models.fields.files.FieldFile.delete", autospec=True)
     @patch("bots.zoom_retention._delete_and_verify_storage", return_value=None)
