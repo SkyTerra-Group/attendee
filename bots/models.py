@@ -389,6 +389,71 @@ class ZoomOAuthConnection(models.Model):
         ]
 
 
+class ZoomRemovalOperationTypes(models.TextChoices):
+    REVOKE_CONNECTION = "revoke_connection", "Revoke connection"
+    PURGE_BOT = "purge_bot", "Purge bot"
+
+
+class ZoomRemovalOperationSources(models.TextChoices):
+    SKYTERRA_INITIATED = "skyterra_initiated", "SkyTerra initiated"
+    ZOOM_DEAUTHORIZATION = "zoom_deauthorization", "Zoom deauthorization"
+
+
+class ZoomRemovalOperationStates(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PENDING_ACTIVE = "pending_active", "Pending active bot"
+    REVOKE_UNKNOWN = "revoke_unknown", "Revoke result unknown"
+    REVOKED = "revoked", "Revoked"
+    DATA_DELETED = "data_deleted", "Sensitive data deleted"
+    PURGE_UNKNOWN = "purge_unknown", "Purge result unknown"
+    PURGED = "purged", "Purged"
+    NOT_FOUND_UNPROVED = "not_found_unproved", "Target absence unproved"
+
+
+class ZoomRemovalOperationPhases(models.TextChoices):
+    PENDING = "pending", "Pending"
+    STORAGE_VERIFIED = "storage_verified", "Storage absence verified"
+    DATA_DELETED = "data_deleted", "Existing delete_data completed"
+    DATABASE_DELETED = "database_deleted", "Database rows deleted"
+    COMPLETE = "complete", "Complete"
+
+
+class ZoomRemovalOperation(models.Model):
+    """Minimal, non-content receipt and retry state for a Zoom removal operation.
+
+    ``target_object_id`` and ``storage_manifest`` are retained only while work is
+    incomplete.  Completed receipts contain only an opaque operation id and a
+    keyed target digest, and expire after the bounded audit window.
+    """
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="zoom_removal_operations")
+    operation_id = models.UUIDField()
+    operation_type = models.CharField(max_length=32, choices=ZoomRemovalOperationTypes.choices)
+    source = models.CharField(max_length=32, choices=ZoomRemovalOperationSources.choices, null=True, blank=True)
+    target_digest = models.CharField(max_length=64)
+    target_object_id = models.CharField(max_length=32, null=True, blank=True)
+    state = models.CharField(max_length=32, choices=ZoomRemovalOperationStates.choices, default=ZoomRemovalOperationStates.PENDING)
+    phase = models.CharField(max_length=32, choices=ZoomRemovalOperationPhases.choices, default=ZoomRemovalOperationPhases.PENDING)
+    failure_code = models.CharField(max_length=64, null=True, blank=True)
+    storage_manifest = models.JSONField(default=dict, blank=True)
+    lease_token = models.UUIDField(null=True, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    attempt_count = models.PositiveIntegerField(default=0)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["project", "operation_id"], name="unique_zoom_removal_operation_id_per_project"),
+            models.UniqueConstraint(fields=["project", "operation_type", "target_digest"], name="unique_zoom_removal_target_per_project"),
+        ]
+        indexes = [
+            models.Index(fields=["project", "operation_id"], name="zoom_remove_project_op_idx"),
+        ]
+
+
 class ZoomMeetingToZoomOAuthConnectionMapping(models.Model):
     OBJECT_ID_PREFIX = "zm_"
 

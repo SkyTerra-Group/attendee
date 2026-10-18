@@ -51,6 +51,10 @@ INSTALLED_APPS = [
 
 CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
 
+# The Zoom removal API is intentionally unreachable until the cross-service
+# retention flow has passed its integrated staging and wording gates.
+ENABLE_ZOOM_RETENTION_REMOVAL_API = os.getenv("ENABLE_ZOOM_RETENTION_REMOVAL_API", "false").lower() == "true"
+
 AUTH_USER_MODEL = "accounts.User"
 
 AUTHENTICATION_BACKENDS = [

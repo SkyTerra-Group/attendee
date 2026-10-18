@@ -22,6 +22,7 @@ from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
 from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
 from bots.tasks.sync_calendar_task import enqueue_sync_calendar_task
 from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_connection_task
+from bots.zoom_retention import delete_expired_receipts
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ class Command(BaseCommand):
                 self._run_periodic_zoom_oauth_connection_syncs()
                 self._run_periodic_zoom_oauth_connection_token_refreshs()
                 self._run_autopay_tasks()
+                delete_expired_receipts()
             except Exception:
                 log.exception("Scheduler cycle failed")
             finally:
