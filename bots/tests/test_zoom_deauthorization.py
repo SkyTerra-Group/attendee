@@ -3208,6 +3208,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(reconnected.get_credentials(), credentials_before)
         new_grant.refresh_from_db()
         self.assertIsNone(new_grant.canonical_removal_operation_id)
+        self.assertEqual(self.grant.generation_ended_at, new_grant.generation_started_at)
         self.assertIsNone(new_grant.generation_ended_at)
         operation = ZoomRemovalOperation.objects.get()
         self.assertEqual(operation.authorization_grant_id, self.grant.pk)
@@ -3229,6 +3230,27 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(alternate.status_code, 200, alternate.content)
         self.assertEqual(alternate.json()["operation_id"], body["operation_id"])
         self.assertEqual(ZoomRemovalOperation.objects.count(), 1)
+
+    def test_historical_grant_cleanup_operation_id_reuse_for_other_grant_conflicts(self):
+        first_reconnect = self._reconnect_same_identity()
+        grant_a = self.grant
+        body_a = self._historical_cleanup_body()
+        self.assertEqual(self._post_historical_cleanup(body_a).status_code, 200)
+        grant_b = first_reconnect.authorization_grant
+        self.grant = grant_b
+        self._reconnect_same_identity()
+        reused = self._post_historical_cleanup(self._historical_cleanup_body(operation_id=body_a["operation_id"]))
+        self.assertEqual(reused.status_code, 409, reused.content)
+        self.assertEqual(reused.json(), {"error": "operation_conflict"})
+        grant_b.refresh_from_db()
+        self.assertIsNone(grant_b.canonical_removal_operation_id)
+        own = self._post_historical_cleanup(self._historical_cleanup_body())
+        self.assertEqual(own.status_code, 200, own.content)
+        self.assertEqual(own.json()["grant_binding_id"], str(grant_b.binding_id))
+        self.assertEqual(
+            set(ZoomRemovalOperation.objects.values_list("authorization_grant_id", flat=True)),
+            {grant_a.pk, grant_b.pk},
+        )
 
     def test_historical_grant_cleanup_concurrent_requests_create_one_operation(self):
         self._reconnect_same_identity()
