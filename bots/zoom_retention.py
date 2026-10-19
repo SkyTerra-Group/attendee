@@ -154,6 +154,12 @@ def operation_result(operation: ZoomRemovalOperation) -> dict:
         result["failure_code"] = operation.failure_code
     if operation.completed_at:
         result["completed_at"] = operation.completed_at.isoformat()
+    if operation.storage_manifest.get("purpose") == HISTORICAL_GRANT_CLEANUP_PURPOSE:
+        result["recovery_purpose"] = HISTORICAL_GRANT_CLEANUP_PURPOSE
+        if operation.authorization_grant_id:
+            result["grant_boundary_error_ms"] = {
+                sample.boundary: sample.error_ms for sample in operation.authorization_grant.clock_samples.all()
+            }
     if operation.authorization_grant_id:
         result.update(
             {
@@ -750,6 +756,110 @@ def process_connection_revoke(
         return ZoomRemovalOperation.objects.get(pk=operation.pk)
     except Exception:
         return _release_claim(operation.pk, lease_token, state=ZoomRemovalOperationStates.REVOKE_UNKNOWN, failure_code="local_revoke_finalize_failed")
+
+
+HISTORICAL_GRANT_CLEANUP_PURPOSE = "historical_grant_cleanup"
+HISTORICAL_GRANT_REMOTE_UNPROVED = "historical_grant_closed_remote_unproved"
+
+
+class HistoricalGrantIneligible(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+def process_historical_grant_cleanup(
+    *,
+    project: Project,
+    operation_id: uuid.UUID,
+    zoom_oauth_app_binding: uuid.UUID,
+    grant_binding_id: uuid.UUID,
+    authorization_generation: uuid.UUID,
+    authorization_ref: uuid.UUID,
+) -> ZoomRemovalOperation:
+    """Record a separately authorized SkyTerra cleanup of one closed grant.
+
+    The grant must already be closed by immutable end evidence, so its local
+    connection row and tokens belong to a later generation (or are gone).  No
+    connection, token, bot, receipt, clock sample or event binding is touched,
+    and neither settlement timestamp is set: this is not a remote revoke and not
+    a binding of any delayed Zoom event to this grant.
+    """
+
+    with transaction.atomic():
+        grant = (
+            ZoomOAuthAuthorizationGrant.objects.select_for_update()
+            .select_related("zoom_oauth_app", "lineage")
+            .filter(
+                project=project,
+                zoom_oauth_app__project=project,
+                zoom_oauth_app__deauthorization_binding_id=zoom_oauth_app_binding,
+                binding_id=grant_binding_id,
+                authorization_generation=authorization_generation,
+            )
+            .first()
+        )
+        if grant is None:
+            raise CrossProjectTarget()
+        if grant.canonical_removal_operation_id is not None:
+            operation = ZoomRemovalOperation.objects.select_for_update().get(pk=grant.canonical_removal_operation_id)
+            _claim_alternate_identifier(operation, operation_id)
+            return operation
+        if grant.generation_ended_at is None or grant.live_connection_id is not None:
+            raise HistoricalGrantIneligible("historical_grant_open")
+        if grant.legacy_history or not grant.lineage.history_complete:
+            raise HistoricalGrantIneligible("historical_grant_unverifiable")
+        # Static end_clock_* fields never carry a claim; only the immutable
+        # operation-sampled boundary rows bound the interval.  An unsampled
+        # (rejected) boundary is never upgraded here.
+        samples = {sample.boundary: sample for sample in grant.clock_samples.all()}
+        start, end = samples.get("start"), samples.get("end")
+        if (
+            start is None
+            or end is None
+            or start.sampled_at != grant.generation_started_at
+            or end.sampled_at != grant.generation_ended_at
+        ):
+            raise HistoricalGrantIneligible("historical_interval_uncertain")
+
+        _lock_identifier(project.pk, operation_id)
+        if get_project_operation(project, operation_id) is not None:
+            raise OperationConflict()
+        app_binding = grant.zoom_oauth_app.deauthorization_binding_id
+        operation = ZoomRemovalOperation.objects.create(
+            project=project,
+            operation_id=operation_id,
+            operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION,
+            source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            target_digest=target_digest(
+                project,
+                ZoomRemovalOperationTypes.REVOKE_CONNECTION,
+                f"historical-grant:{grant.binding_id}",
+            ),
+            target_object_id=None,
+            target_generation=grant.authorization_generation,
+            authorization_grant=grant,
+            zoom_oauth_app_binding=app_binding,
+            connection_digest=grant.connection_digest,
+            app_digest=hashlib.sha256(str(app_binding).encode("ascii")).hexdigest(),
+            state=ZoomRemovalOperationStates.NOT_FOUND_UNPROVED,
+            phase=ZoomRemovalOperationPhases.COMPLETE,
+            failure_code=HISTORICAL_GRANT_REMOTE_UNPROVED,
+            storage_manifest={
+                "purpose": HISTORICAL_GRANT_CLEANUP_PURPOSE,
+                "authorization_ref_digest": hashlib.sha256(str(authorization_ref).encode("ascii")).hexdigest(),
+            },
+        )
+        ZoomRemovalOperationIdentifier.objects.create(
+            project=project,
+            identifier_uuid=operation_id,
+            operation=operation,
+            role=ZoomRemovalOperationIdentifierRoles.CANONICAL,
+            grant_binding_digest=hashlib.sha256(str(grant.binding_id).encode("ascii")).hexdigest(),
+        )
+        grant.canonical_removal_operation = operation
+        grant.save(update_fields=["canonical_removal_operation", "updated_at"])
+        return operation
 
 
 def _storage_manifest(bot: Bot) -> dict:

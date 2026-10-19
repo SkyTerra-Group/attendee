@@ -25,13 +25,16 @@ from .zoom_deauthorization_assertion import (
 from .zoom_deauthorization_grants import database_clock_now
 from .zoom_retention import (
     MAX_PURGE_TARGETS,
+    HISTORICAL_GRANT_CLEANUP_PURPOSE,
     CrossProjectTarget,
+    HistoricalGrantIneligible,
     OperationConflict,
     UntrustedDeauthorizationSource,
     get_project_operation,
     operation_result,
     process_bot_purge,
     process_connection_revoke,
+    process_historical_grant_cleanup,
 )
 
 
@@ -150,6 +153,58 @@ class ZoomConnectionRevokeView(GenericAPIView):
             return _safe_conflict_response(error)
         except UntrustedDeauthorizationSource:
             return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(operation_result(operation), status=status.HTTP_200_OK)
+
+
+_HISTORICAL_GRANT_CLEANUP_FIELDS = frozenset(
+    {
+        "project_id",
+        "operation_id",
+        "zoom_oauth_app_binding",
+        "grant_binding_id",
+        "authorization_generation",
+        "source",
+        "purpose",
+        "authorization_ref",
+    }
+)
+
+
+class ZoomHistoricalGrantCleanupView(GenericAPIView):
+    """Separately authorized cleanup receipt for one exact closed grant.
+
+    Never binds or settles a Zoom deauthorization event and never claims a
+    remote OAuth revoke; see ``process_historical_grant_cleanup``.
+    """
+
+    authentication_classes = [ApiKeyAuthentication]
+    throttle_classes = [ProjectPostThrottle]
+
+    def post(self, request):
+        _require_enabled()
+        if not _scope_is_valid(request):
+            return Response({"error": "scope_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        if set(request.data.keys()) != _HISTORICAL_GRANT_CLEANUP_FIELDS:
+            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
+        values = {
+            name: _uuid(request.data.get(name))
+            for name in ("operation_id", "zoom_oauth_app_binding", "grant_binding_id", "authorization_generation", "authorization_ref")
+        }
+        if (
+            any(value is None for value in values.values())
+            or request.data.get("source") != ZoomRemovalOperationSources.SKYTERRA_INITIATED
+            or request.data.get("purpose") != HISTORICAL_GRANT_CLEANUP_PURPOSE
+        ):
+            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            operation = process_historical_grant_cleanup(project=request.auth.project, **values)
+        except CrossProjectTarget:
+            return Response({"error": "scope_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        except HistoricalGrantIneligible as error:
+            return Response({"error": error.code}, status=status.HTTP_409_CONFLICT)
+        except OperationConflict as error:
+            return _safe_conflict_response(error)
         return Response(operation_result(operation), status=status.HTTP_200_OK)
 
 

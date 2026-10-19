@@ -46,6 +46,7 @@ from bots.models import (
     ZoomOAuthAuthorizationGrantClockSample,
     ZoomOAuthAuthorizationLineage,
     ZoomOAuthConnection,
+    ZoomOAuthConnectionStates,
     ZoomRemovalAuditKeyFingerprint,
     ZoomRemovalOperation,
     ZoomRemovalOperationIdentifier,
@@ -3120,6 +3121,176 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             self.zoom_app.object_id,
         )
         self.assertIn(b"code=invalid_signature", rejected_logs.bytes)
+
+
+    def _reconnect_same_identity(self):
+        token = {
+            "access_token": "access-historical-marker",
+            "refresh_token": "refresh-historical-marker",
+            "scope": "user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token",
+        }
+        user = {"id": self.connection.user_id, "account_id": self.connection.account_id, "status": "active"}
+        payload = {
+            "zoom_oauth_app_binding": str(self.app_binding),
+            "authorization_code": "historical-code-marker",
+            "redirect_uri": "https://client-agent.test/reconnect",
+        }
+        with patch("bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens", return_value=token), patch(
+            "bots.zoom_oauth_connections_api_utils._get_user_info", return_value=user
+        ):
+            reconnected, error = create_zoom_oauth_connection(payload, self.project)
+        self.assertIsNone(error)
+        self.grant.refresh_from_db()
+        return reconnected
+
+    def _historical_cleanup_body(self, **overrides):
+        body = {
+            "project_id": self.project.object_id,
+            "operation_id": str(uuid.uuid4()),
+            "zoom_oauth_app_binding": str(self.app_binding),
+            "grant_binding_id": str(self.grant.binding_id),
+            "authorization_generation": str(self.grant.authorization_generation),
+            "source": "skyterra_initiated",
+            "purpose": "historical_grant_cleanup",
+            "authorization_ref": str(uuid.uuid4()),
+        }
+        body.update(overrides)
+        return {key: value for key, value in body.items() if value is not None}
+
+    def _post_historical_cleanup(self, body, *, api_key=None):
+        return self.client.post(
+            "/api/v1/zoom_retention/historical_grant_cleanup",
+            data=json.dumps(body),
+            content_type="application/json",
+            HTTP_AUTHORIZATION=f"Token {api_key or self.api_key}",
+        )
+
+    def test_historical_grant_cleanup_after_reconnect_preserves_new_generation(self):
+        old_generation = self.grant.authorization_generation
+        reconnected = self._reconnect_same_identity()
+        new_generation = reconnected.authorization_generation
+        self.assertNotEqual(new_generation, old_generation)
+        self.assertIsNotNone(self.grant.generation_ended_at)
+        new_grant = reconnected.authorization_grant
+        credentials_before = reconnected.get_credentials()
+        body = self._historical_cleanup_body()
+        with patch("bots.zoom_retention._revoke_at_zoom") as provider:
+            response = self._post_historical_cleanup(body)
+        provider.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.content)
+        result = response.json()
+        self.assertEqual(result["operation_id"], body["operation_id"])
+        self.assertEqual(result["state"], "not_found_unproved")
+        self.assertEqual(result["phase"], "complete")
+        self.assertEqual(result["failure_code"], "historical_grant_closed_remote_unproved")
+        self.assertEqual(result["recovery_purpose"], "historical_grant_cleanup")
+        self.assertIsNone(result["terminal_basis"])
+        self.assertEqual(result["evidence"], {"provider_revoke": False, "signed_deauthorization": False})
+        self.assertEqual(result["grant_binding_id"], str(self.grant.binding_id))
+        self.assertEqual(result["connection_generation"], str(old_generation))
+        self.assertEqual(result["generation_ended_at"], self.grant.generation_ended_at.isoformat())
+        self.assertNotIn("event_binding_id", result)
+        self.assertEqual(set(result["grant_boundary_error_ms"]), {"start", "end"})
+        content = response.content.decode()
+        for marker in (self.connection.user_id, self.connection.account_id, body["authorization_ref"], str(new_generation)):
+            self.assertNotIn(marker, content)
+
+        readback = self.client.get(
+            f"/api/v1/zoom_retention/operations/{body['operation_id']}",
+            HTTP_AUTHORIZATION=f"Token {self.api_key}",
+        )
+        self.assertEqual(readback.status_code, 200)
+        self.assertEqual(readback.json(), result)
+
+        reconnected.refresh_from_db()
+        self.assertEqual(reconnected.authorization_generation, new_generation)
+        self.assertEqual(reconnected.state, ZoomOAuthConnectionStates.CONNECTED)
+        self.assertEqual(reconnected.get_credentials(), credentials_before)
+        new_grant.refresh_from_db()
+        self.assertIsNone(new_grant.canonical_removal_operation_id)
+        self.assertIsNone(new_grant.generation_ended_at)
+        operation = ZoomRemovalOperation.objects.get()
+        self.assertEqual(operation.authorization_grant_id, self.grant.pk)
+        self.assertIsNone(operation.provider_revoke_settled_at)
+        self.assertIsNone(operation.signed_deauthorization_settled_at)
+        self.assertIsNone(operation.verified_deauthorization_event_digest)
+        self.assertNotIn(body["authorization_ref"], json.dumps(operation.storage_manifest))
+        self.assertFalse(ZoomDeauthorizationEventBinding.objects.exists())
+        self.assertFalse(ZoomDeauthorizationTargetResolution.objects.exists())
+
+    def test_historical_grant_cleanup_is_idempotent_and_single_canonical(self):
+        self._reconnect_same_identity()
+        body = self._historical_cleanup_body()
+        first = self._post_historical_cleanup(body)
+        repeated = self._post_historical_cleanup(body)
+        alternate = self._post_historical_cleanup(dict(body, operation_id=str(uuid.uuid4()), authorization_ref=str(uuid.uuid4())))
+        self.assertEqual(first.status_code, 200, first.content)
+        self.assertEqual(repeated.json(), first.json())
+        self.assertEqual(alternate.status_code, 200, alternate.content)
+        self.assertEqual(alternate.json()["operation_id"], body["operation_id"])
+        self.assertEqual(ZoomRemovalOperation.objects.count(), 1)
+
+    def test_historical_grant_cleanup_concurrent_requests_create_one_operation(self):
+        self._reconnect_same_identity()
+        bodies = [self._historical_cleanup_body() for _ in range(4)]
+
+        def post(body):
+            try:
+                return self._post_historical_cleanup(body)
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(post, bodies))
+        self.assertEqual([response.status_code for response in responses], [200] * 4)
+        self.assertEqual(len({response.json()["operation_id"] for response in responses}), 1)
+        self.assertEqual(ZoomRemovalOperation.objects.count(), 1)
+
+    def test_historical_grant_cleanup_refuses_open_mismatched_and_cross_scope(self):
+        open_response = self._post_historical_cleanup(self._historical_cleanup_body())
+        self.assertEqual(open_response.status_code, 409)
+        self.assertEqual(open_response.json(), {"error": "historical_grant_open"})
+        reconnected = self._reconnect_same_identity()
+        current = self._post_historical_cleanup(
+            self._historical_cleanup_body(
+                grant_binding_id=str(reconnected.authorization_grant.binding_id),
+                authorization_generation=str(reconnected.authorization_generation),
+            )
+        )
+        self.assertEqual(current.status_code, 409)
+        self.assertEqual(current.json(), {"error": "historical_grant_open"})
+        for overrides in (
+            {"authorization_generation": str(reconnected.authorization_generation)},
+            {"authorization_generation": str(uuid.uuid4())},
+            {"zoom_oauth_app_binding": str(uuid.uuid4())},
+            {"grant_binding_id": str(uuid.uuid4())},
+        ):
+            response = self._post_historical_cleanup(self._historical_cleanup_body(**overrides))
+            self.assertEqual(response.status_code, 404, overrides)
+            self.assertEqual(response.json(), {"error": "scope_not_found"})
+        cross = self._post_historical_cleanup(
+            self._historical_cleanup_body(project_id=self.other_project.object_id),
+            api_key=self.other_api_key,
+        )
+        self.assertEqual(cross.status_code, 404)
+        for overrides in (
+            {"source": "zoom_deauthorization"},
+            {"purpose": "settle_event"},
+            {"authorization_ref": None},
+            {"authorization_ref": "not-a-uuid"},
+            {"cutoff": "now"},
+        ):
+            response = self._post_historical_cleanup(self._historical_cleanup_body(**overrides))
+            self.assertEqual(response.status_code, 400, overrides)
+        self.assertFalse(ZoomRemovalOperation.objects.exists())
+
+    def test_historical_grant_cleanup_refuses_uncertain_or_legacy_interval(self):
+        self._reconnect_same_identity()
+        ZoomOAuthAuthorizationGrantClockSample.objects.filter(authorization_grant=self.grant, boundary="end").delete()
+        uncertain = self._post_historical_cleanup(self._historical_cleanup_body())
+        self.assertEqual(uncertain.status_code, 409)
+        self.assertEqual(uncertain.json(), {"error": "historical_interval_uncertain"})
+        self.assertFalse(ZoomRemovalOperation.objects.exists())
 
 
 class ZoomDeauthorizationAuditKeyringMigrationTests(TransactionTestCase):
