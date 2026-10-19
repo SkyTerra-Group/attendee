@@ -140,8 +140,15 @@ def sample(query, policy, probe=None):
     delta = db_at - datetime(1970, 1, 1, tzinfo=timezone.utc)
     stamp_us = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
     maxerr = max(k0.maxerror_us, k1.maxerror_us)
+    # The query ran between the two local readings and each is within maxerr
+    # of UTC, so the true instant T lies in [lower, upper]. Then for ANY stamp
+    # V, |V - T| <= max(V - lower, upper - V): a database offset that puts V
+    # outside the interval is charged into error_ms (and a large one fails
+    # clock_bound_excessive), never assumed away. Requiring V inside the
+    # interval added no guarantee: it rejected honest small offsets yet passed
+    # a host and database that are wrong by the same amount.
     lower_us, upper_us = w0 // 1000 - maxerr, -(-w1 // 1000) + maxerr
-    if not lower_us <= stamp_us <= upper_us:
+    if lower_us > upper_us:
         _reject('clock_bracket_violation')
     error_ms = -(-max(stamp_us - lower_us, upper_us - stamp_us) // 1000) + 1
     if error_ms > policy.max_sample_error_ms:
