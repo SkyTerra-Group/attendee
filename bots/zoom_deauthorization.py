@@ -83,6 +83,9 @@ _EVIDENCE_SNAPSHOT_FIELDS = {
     "attendee_boundary_clock_health_ids",
     "attendee_boundary_clock_error_ms",
     "attendee_boundary_clock_continuous",
+    "attendee_receipt_clock_health_id",
+    "attendee_receipt_clock_error_ms",
+    "attendee_receipt_clock_continuous",
     "grant_binding_id",
     "connection_generation",
     "lineage_sequence",
@@ -205,7 +208,11 @@ def _validate_existing_binding_claims(binding: ZoomDeauthorizationEventBinding, 
         raise DeauthorizationServiceError("event_binding_conflict")
 
 
-def _candidate_snapshot(assertion: VerifiedDeauthorizationAssertion, grant: ZoomOAuthAuthorizationGrant) -> dict:
+def _candidate_snapshot(
+    assertion: VerifiedDeauthorizationAssertion,
+    grant: ZoomOAuthAuthorizationGrant,
+    receipt_clock,
+) -> dict:
     claims = assertion.claims
     return {
         "temporal_policy": TEMPORAL_POLICY,
@@ -225,6 +232,9 @@ def _candidate_snapshot(assertion: VerifiedDeauthorizationAssertion, grant: Zoom
         "attendee_boundary_clock_health_ids": [grant.start_clock_health_id, grant.end_clock_health_id],
         "attendee_boundary_clock_error_ms": [grant.start_clock_error_ms, grant.end_clock_error_ms],
         "attendee_boundary_clock_continuous": [grant.start_clock_continuous, grant.end_clock_continuous],
+        "attendee_receipt_clock_health_id": receipt_clock.health_id,
+        "attendee_receipt_clock_error_ms": receipt_clock.error_ms,
+        "attendee_receipt_clock_continuous": receipt_clock.continuous,
         "grant_binding_id": str(grant.binding_id),
         "connection_generation": str(grant.authorization_generation),
         "lineage_sequence": grant.grant_sequence,
@@ -303,7 +313,7 @@ def _fresh_binding_evidence(assertion: VerifiedDeauthorizationAssertion, grant: 
         raise DeauthorizationServiceError("unresolved_temporal_order")
     if grant.generation_ended_at is not None and not upper < grant.generation_ended_at:
         raise DeauthorizationServiceError("unresolved_temporal_order")
-    snapshot = _candidate_snapshot(assertion, grant)
+    snapshot = _candidate_snapshot(assertion, grant, receipt_clock)
     return snapshot, candidate_temporal_evidence_digest(snapshot)
 
 
@@ -497,7 +507,11 @@ def _resolution_from_binding(project, app, binding):
 def resolution_result(resolution):
     result = {"outcome": resolution.outcome, "resolution_id": str(resolution.resolution_id)}
     if resolution.event_binding_id:
-        result.update(_binding_recovery(resolution.event_binding))
+        binding = resolution.event_binding
+        if not hmac.compare_digest(resolution.event_digest, binding.event_digest):
+            raise DeauthorizationServiceError("event_binding_conflict")
+        result.update(_binding_recovery(binding))
+        result["verified_deauthorization_event_digest"] = binding.event_digest
     if resolution.operation_id:
         snapshot = resolution.event_binding.evidence_snapshot if resolution.event_binding_id else {}
         result.update(

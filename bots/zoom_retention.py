@@ -117,6 +117,20 @@ def target_digest(project: Project, operation_type: str, target_object_id: str) 
 
 def operation_result(operation: ZoomRemovalOperation) -> dict:
     canonical_id = canonical_operation_id(operation)
+    binding = operation.deauthorization_event_bindings.order_by("id").first()
+    operation_event_digest = operation.verified_deauthorization_event_digest
+    if operation_event_digest is not None and (
+        binding is None
+        or not hmac.compare_digest(operation_event_digest, binding.event_digest)
+    ):
+        raise DatabaseVerificationError()
+    if operation.signed_deauthorization_settled_at is not None and (
+        binding is None
+        or operation_event_digest is None
+        or operation.verified_deauthorization_at is None
+        or not hmac.compare_digest(operation_event_digest, binding.event_digest)
+    ):
+        raise DatabaseVerificationError()
     result = {
         "operation_id": str(canonical_id),
         "operation_type": operation.operation_type,
@@ -151,13 +165,16 @@ def operation_result(operation: ZoomRemovalOperation) -> dict:
                 },
             }
         )
-        binding = operation.deauthorization_event_bindings.order_by("id").first()
         if binding:
             snapshot = binding.evidence_snapshot
             result.update(
                 {
                     "event_binding_id": str(binding.binding_id),
                     "event_binding_version": binding.binding_version,
+                    # This is SHA-256 of the already opaque Zoom event
+                    # identifier. It lets Client-Agent authenticate response-
+                    # loss readback without returning that identifier itself.
+                    "verified_deauthorization_event_digest": binding.event_digest,
                     "temporal_policy": binding.temporal_policy,
                     "temporal_evidence_digest": binding.binding_evidence_digest,
                     "generation_started_at": snapshot["generation_started_at"],

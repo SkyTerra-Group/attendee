@@ -13,7 +13,14 @@ from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from django.db import IntegrityError, close_old_connections, transaction
+from django.db import (
+    IntegrityError,
+    close_old_connections,
+    transaction,
+)
+from django.db import (
+    connection as django_db_connection,
+)
 from django.test import Client, SimpleTestCase, TransactionTestCase, override_settings
 
 from attendee.logging import ZoomTrustBoundaryRedactionFilter
@@ -43,9 +50,11 @@ from bots.models import (
 from bots.serializers import ZoomOAuthConnectionSerializer
 from bots.tasks.refresh_zoom_oauth_connection_task import refresh_zoom_oauth_connection
 from bots.zoom_deauthorization import (
+    DeauthorizationServiceError,
     _candidate_snapshot,
     binding_temporal_evidence_digest,
     candidate_temporal_evidence_digest,
+    resolution_result,
 )
 from bots.zoom_deauthorization_assertion import (
     ASSERTION_TYP,
@@ -57,13 +66,20 @@ from bots.zoom_deauthorization_assertion import (
     AssertionRejected,
     verify_deauthorization_assertion,
 )
-from bots.zoom_deauthorization_grants import database_clock_now, expected_client_id_digest, provider_identity_digest
+from bots.zoom_deauthorization_grants import (
+    configured_clock_evidence,
+    database_clock_now,
+    expected_client_id_digest,
+    provider_identity_digest,
+)
 from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
 from bots.zoom_retention import (
+    DatabaseVerificationError,
     ProviderOutcome,
     _claim_alternate_identifier,
     _get_or_create_operation,
     delete_expired_receipts,
+    operation_result,
     process_connection_revoke,
 )
 
@@ -75,6 +91,10 @@ TEST_AUDIT_KEY = "test-only-removal-audit-key-32-bytes-minimum"
 
 def b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def opaque_event_id() -> str:
+    return f"zev_{uuid.uuid4().hex}{uuid.uuid4().hex}"
 
 
 def sign_claims(claims, *, private_key=None, header=None):
@@ -318,7 +338,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             "binding_mode": mode,
             "project_id": self.project.object_id,
             "zoom_oauth_app_binding": str(self.app_binding),
-            "zoom_event_id": event_id or f"zev_{uuid.uuid4().hex}",
+            "zoom_event_id": event_id or opaque_event_id(),
             "zoom_event_at": event_at,
             "zoom_request_signed_at": request_at,
             "first_verified_at": first_at,
@@ -352,6 +372,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 received_at=datetime.fromtimestamp(claims["iat"], tz=datetime_timezone.utc),
             ),
             self.grant,
+            configured_clock_evidence(),
         )
         claims["temporal_evidence_digest"] = candidate_temporal_evidence_digest(snapshot)
         return claims
@@ -396,6 +417,10 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(response.json()["terminal_basis"], "signed_zoom_deauthorization")
         self.assertTrue(response.json()["evidence"]["signed_deauthorization"])
         self.assertFalse(response.json()["evidence"]["provider_revoke"])
+        self.assertEqual(
+            response.json()["verified_deauthorization_event_digest"],
+            hashlib.sha256(claims["zoom_event_id"].encode("ascii")).hexdigest(),
+        )
         self.assertFalse(ZoomOAuthConnection.objects.filter(pk=self.connection.pk).exists())
         self.assertFalse(ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(pk=mapping.pk).exists())
         self.assertFalse(WebhookDeliveryAttempt.objects.filter(pk=delivery.pk).exists())
@@ -432,7 +457,16 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         recovery = self.post_assertion("/api/v1/zoom_retention/deauthorization", claims)
         self.assertEqual(recovery.status_code, 409)
         self.assertEqual(recovery.json()["error"], "binding_already_exists")
-        self.assertIn("event_binding_id", recovery.json())
+        self.assertEqual(
+            set(recovery.json()),
+            {
+                "error",
+                "event_binding_id",
+                "event_binding_version",
+                "temporal_evidence_digest",
+            },
+        )
+        self.assertNotIn(claims["zoom_event_id"], recovery.content.decode())
         self.assertEqual(ZoomDeauthorizationAssertionReceipt.objects.count(), 1)
 
     def test_one_grant_operation_cannot_bind_two_distinct_provider_events(self):
@@ -475,6 +509,41 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(replay.status_code, 200, replay.content)
         self.assertEqual(ZoomDeauthorizationEventBinding.objects.count(), 1)
         self.assertEqual(ZoomRemovalOperation.objects.count(), 1)
+
+    @override_settings(ZOOM_DEAUTH_DB_CLOCK_ERROR_MS=700)
+    def test_receipt_clock_max_error_is_frozen_and_retry_uses_exact_snapshot(self):
+        claims = self.settle_claims()
+        claims["client_clock_error_ms"] = 300
+        first = self.post_assertion("/api/v1/zoom_retention/deauthorization", claims)
+        self.assertEqual(first.status_code, 200, first.content)
+        binding = ZoomDeauthorizationEventBinding.objects.get()
+        self.assertEqual(
+            binding.evidence_snapshot["attendee_receipt_clock_health_id"],
+            "attendee-db-clock-test-v1",
+        )
+        self.assertEqual(binding.evidence_snapshot["attendee_receipt_clock_error_ms"], 700)
+        self.assertIs(binding.evidence_snapshot["attendee_receipt_clock_continuous"], True)
+        self.assertEqual(binding.evidence_snapshot["client_clock_error_ms"], 300)
+
+        claims.update(
+            {
+                "binding_mode": EXISTING_ONLY,
+                "jti": str(uuid.uuid4()),
+                "temporal_evidence_digest": binding.binding_evidence_digest,
+            }
+        )
+        with override_settings(
+            ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID="changed-untrusted-clock",
+            ZOOM_DEAUTH_DB_CLOCK_ERROR_MS=1001,
+            ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS=False,
+        ):
+            replay = self.post_assertion(
+                "/api/v1/zoom_retention/deauthorization",
+                claims,
+            )
+        self.assertEqual(replay.status_code, 200, replay.content)
+        binding.refresh_from_db()
+        self.assertEqual(binding.evidence_snapshot["attendee_receipt_clock_error_ms"], 700)
 
     def test_existing_only_resolver_miss_is_target_free_and_never_matches(self):
         claims = self.resolve_claims(mode=EXISTING_ONLY)
@@ -544,19 +613,14 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertFalse(ZoomRemovalOperation.objects.exists())
         self.assertFalse(ZoomDeauthorizationAssertionReceipt.objects.exists())
 
-    def test_four_timestamp_horizon_29_succeeds_and_30_is_durable_unbound(self):
+    def test_four_timestamp_horizon_29_succeeds(self):
         fresh = self.resolve_claims(event_at=self.now - 29, request_at=self.now, first_at=self.now, iat=self.now)
         accepted = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", fresh)
         self.assertEqual(accepted.status_code, 200, accepted.content)
         self.assertEqual(accepted.json()["outcome"], ZoomDeauthorizationResolutionOutcomes.RESOLVED)
         self.assertEqual(ZoomDeauthorizationEventBinding.objects.count(), 1)
 
-        ZoomDeauthorizationAssertionReceipt.objects.all().delete()
-        ZoomDeauthorizationTargetResolution.objects.all().delete()
-        ZoomDeauthorizationEventBinding.objects.all().delete()
-        ZoomRemovalOperation.objects.all().delete()
-        self.grant.canonical_removal_operation = None
-        self.grant.save(update_fields=["canonical_removal_operation", "updated_at"])
+    def test_four_timestamp_horizon_30_is_durable_unbound(self):
         stale = self.resolve_claims(event_at=self.now - 30, request_at=self.now, first_at=self.now, iat=self.now)
         rejected = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", stale)
         self.assertEqual(rejected.status_code, 200)
@@ -616,6 +680,28 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", claims)
                 self.assertEqual(response.status_code, 401)
                 self.assertEqual(response.json()["error"], code)
+        self.assertFalse(ZoomDeauthorizationAssertionReceipt.objects.exists())
+
+    def test_event_id_requires_exact_lowercase_hmac_sha256_shape_without_mutation(self):
+        invalid_event_ids = (
+            "zev_" + "A" * 64,
+            "zev_" + "g" * 64,
+            "zev_" + "_" + "a" * 63,
+            "zev_" + "a" * 63,
+            "zev_" + "a" * 65,
+        )
+        for event_id in invalid_event_ids:
+            with self.subTest(event_id=event_id):
+                response = self.post_assertion(
+                    "/api/v1/zoom_retention/deauthorization/resolve",
+                    self.resolve_claims(event_id=event_id),
+                )
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json()["error"], "event_id_invalid")
+        self.assertTrue(ZoomOAuthConnection.objects.filter(pk=self.connection.pk).exists())
+        self.assertFalse(ZoomRemovalOperation.objects.exists())
+        self.assertFalse(ZoomDeauthorizationEventBinding.objects.exists())
+        self.assertFalse(ZoomDeauthorizationTargetResolution.objects.exists())
         self.assertFalse(ZoomDeauthorizationAssertionReceipt.objects.exists())
 
     def test_combined_clock_error_over_one_second_is_durable_clock_untrusted(self):
@@ -703,6 +789,8 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(first.status_code, 200)
         canonical = first.json()["operation_id"]
         binding = ZoomDeauthorizationEventBinding.objects.get()
+        expected_event_digest = hashlib.sha256(claims["zoom_event_id"].encode("ascii")).hexdigest()
+        self.assertEqual(first.json()["verified_deauthorization_event_digest"], expected_event_digest)
         alternate = uuid.uuid4()
         claims.update(
             {
@@ -723,14 +811,66 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             self.assertEqual(readback.status_code, 200)
             self.assertEqual(readback.json()["operation_id"], canonical)
             self.assertEqual(readback.json()["event_binding_id"], str(binding.binding_id))
+            self.assertEqual(
+                readback.json()["verified_deauthorization_event_digest"],
+                expected_event_digest,
+            )
+            rendered = readback.content.decode()
+            for raw_marker in (
+                claims["zoom_event_id"],
+                self.connection.user_id,
+                self.connection.account_id,
+                self.connection.object_id,
+            ):
+                self.assertNotIn(raw_marker, rendered)
 
     def test_resolver_supplied_binding_requires_exact_resolution_receipt(self):
-        event_id = f"zev_{uuid.uuid4().hex}"
+        event_id = opaque_event_id()
         resolved = self.post_assertion(
             "/api/v1/zoom_retention/deauthorization/resolve",
             self.resolve_claims(event_id=event_id),
         )
         self.assertEqual(resolved.status_code, 200, resolved.content)
+        expected_event_digest = hashlib.sha256(event_id.encode("ascii")).hexdigest()
+        self.assertEqual(
+            set(resolved.json()),
+            {
+                "app_digest",
+                "connection_digest",
+                "connection_generation",
+                "event_binding_id",
+                "event_binding_version",
+                "generation_ended_at",
+                "generation_started_at",
+                "grant_binding_id",
+                "grant_history_complete",
+                "grant_sequence",
+                "operation_id",
+                "outcome",
+                "resolution_id",
+                "temporal_evidence_digest",
+                "verified_deauthorization_event_digest",
+                "zoom_oauth_app_binding",
+            },
+        )
+        self.assertEqual(
+            resolved.json()["verified_deauthorization_event_digest"],
+            expected_event_digest,
+        )
+        operation = ZoomRemovalOperation.objects.get()
+        self.assertIsNone(operation.verified_deauthorization_event_digest)
+        self.assertIsNone(operation.signed_deauthorization_settled_at)
+        pre_settlement_readback = self.client.get(
+            f"/api/v1/zoom_retention/operations/{resolved.json()['operation_id']}",
+            HTTP_AUTHORIZATION=f"Token {self.api_key}",
+        )
+        self.assertEqual(pre_settlement_readback.status_code, 200)
+        self.assertEqual(
+            pre_settlement_readback.json()["verified_deauthorization_event_digest"],
+            expected_event_digest,
+        )
+        self.assertFalse(pre_settlement_readback.json()["evidence"]["signed_deauthorization"])
+        self.assertNotIn(event_id, pre_settlement_readback.content.decode())
         settlement = self.settle_claims(
             event_id=event_id,
             operation_id=uuid.UUID(resolved.json()["operation_id"]),
@@ -754,9 +894,13 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             settlement,
         )
         self.assertEqual(accepted.status_code, 200, accepted.content)
+        self.assertEqual(
+            accepted.json()["verified_deauthorization_event_digest"],
+            expected_event_digest,
+        )
 
     def test_provider_first_and_signed_first_converge_without_second_provider_call(self):
-        event_id = f"zev_{uuid.uuid4().hex}"
+        event_id = opaque_event_id()
         resolver_claims = self.resolve_claims(event_id=event_id)
         resolved = self.post_assertion(
             "/api/v1/zoom_retention/deauthorization/resolve",
@@ -791,6 +935,23 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(signed.json()["terminal_basis"], "provider_and_signed")
         self.assertTrue(signed.json()["evidence"]["provider_revoke"])
         self.assertTrue(signed.json()["evidence"]["signed_deauthorization"])
+        expected_event_digest = hashlib.sha256(event_id.encode("ascii")).hexdigest()
+        self.assertEqual(
+            signed.json()["verified_deauthorization_event_digest"],
+            expected_event_digest,
+        )
+        combined_readback = self.client.get(
+            f"/api/v1/zoom_retention/operations/{canonical}",
+            HTTP_AUTHORIZATION=f"Token {self.api_key}",
+        )
+        self.assertEqual(combined_readback.status_code, 200)
+        self.assertEqual(
+            combined_readback.json()["verified_deauthorization_event_digest"],
+            expected_event_digest,
+        )
+        self.assertTrue(combined_readback.json()["evidence"]["provider_revoke"])
+        self.assertTrue(combined_readback.json()["evidence"]["signed_deauthorization"])
+        self.assertNotIn(event_id, combined_readback.content.decode())
         second_provider.assert_not_called()
 
         # A signed-first operation is already terminal. The ordinary revoke
@@ -848,7 +1009,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         provider_after_signed.assert_not_called()
 
     def test_bound_response_loss_recovery_after_reconnect_preserves_new_generation(self):
-        event_id = f"zev_{uuid.uuid4().hex}"
+        event_id = opaque_event_id()
         resolver_claims = self.resolve_claims(event_id=event_id)
         resolved = self.post_assertion(
             "/api/v1/zoom_retention/deauthorization/resolve",
@@ -991,7 +1152,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(retry.json()["operation_id"], own_canonical)
 
     def test_concurrent_create_assertions_converge_on_one_binding_and_delete(self):
-        event_id = f"zev_{uuid.uuid4().hex}"
+        event_id = opaque_event_id()
         claims = [
             self.settle_claims(event_id=event_id, operation_id=uuid.uuid4()),
             self.settle_claims(event_id=event_id, operation_id=uuid.uuid4()),
@@ -1126,6 +1287,153 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             with transaction.atomic():
                 ZoomRemovalOperation.objects.filter(pk=operation.pk).update(
                     state=ZoomRemovalOperationStates.PENDING
+                )
+
+    def test_operation_event_digest_consistency_fails_closed_in_app_and_database(self):
+        event_id = opaque_event_id()
+        resolved = self.post_assertion(
+            "/api/v1/zoom_retention/deauthorization/resolve",
+            self.resolve_claims(event_id=event_id),
+        )
+        self.assertEqual(resolved.status_code, 200, resolved.content)
+        operation = ZoomRemovalOperation.objects.get()
+        expected_event_digest = hashlib.sha256(event_id.encode("ascii")).hexdigest()
+
+        operation.verified_deauthorization_event_digest = "0" * 64
+        operation.verified_deauthorization_at = database_clock_now()
+        with self.assertRaises(DatabaseVerificationError):
+            operation_result(operation)
+
+        operation.verified_deauthorization_event_digest = expected_event_digest
+        operation.verified_deauthorization_at = None
+        operation.signed_deauthorization_settled_at = database_clock_now()
+        with self.assertRaises(DatabaseVerificationError):
+            operation_result(operation)
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic(), django_db_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE bots_zoomremovaloperation
+                       SET verified_deauthorization_event_digest = %s,
+                           verified_deauthorization_at = %s
+                     WHERE id = %s
+                    """,
+                    ["0" * 64, database_clock_now(), operation.pk],
+                )
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic(), django_db_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE bots_zoomremovaloperation
+                       SET signed_deauthorization_settled_at = %s,
+                           terminal_basis = %s
+                     WHERE id = %s
+                    """,
+                    [database_clock_now(), "signed_zoom_deauthorization", operation.pk],
+                )
+
+        operation.refresh_from_db()
+        self.assertIsNone(operation.verified_deauthorization_event_digest)
+        self.assertIsNone(operation.verified_deauthorization_at)
+        self.assertIsNone(operation.signed_deauthorization_settled_at)
+
+        settlement = self.settle_claims(
+            event_id=event_id,
+            operation_id=uuid.UUID(resolved.json()["operation_id"]),
+            mode=EXISTING_ONLY,
+        )
+        settlement["resolution_id"] = resolved.json()["resolution_id"]
+        settlement["temporal_evidence_digest"] = resolved.json()[
+            "temporal_evidence_digest"
+        ]
+        accepted = self.post_assertion(
+            "/api/v1/zoom_retention/deauthorization",
+            settlement,
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.content)
+        operation.refresh_from_db()
+        self.assertIsNotNone(operation.signed_deauthorization_settled_at)
+
+        binding = ZoomDeauthorizationEventBinding.objects.get()
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic(), django_db_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE bots_zoomdeauthorizationeventbinding
+                       SET operation_id = NULL
+                     WHERE id = %s
+                    """,
+                    [binding.pk],
+                )
+
+        other_operation = _get_or_create_operation(
+            project=self.project,
+            operation_id=uuid.uuid4(),
+            operation_type=ZoomRemovalOperationTypes.PURGE_BOT,
+            target_object_id="bot_binding_reassignment_test",
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic(), django_db_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE bots_zoomdeauthorizationeventbinding
+                       SET operation_id = %s
+                     WHERE id = %s
+                    """,
+                    [other_operation.pk, binding.pk],
+                )
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic(), django_db_connection.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM bots_zoomdeauthorizationeventbinding WHERE id = %s",
+                    [binding.pk],
+                )
+
+        resolution = ZoomDeauthorizationTargetResolution.objects.get()
+        resolution.event_digest = "1" * 64
+        with self.assertRaises(DeauthorizationServiceError):
+            resolution_result(resolution)
+
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic(), django_db_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO bots_zoomdeauthorizationtargetresolution (
+                        resolution_id,
+                        project_id,
+                        zoom_oauth_app_id,
+                        event_digest,
+                        outcome,
+                        event_binding_id,
+                        authorization_grant_id,
+                        operation_id,
+                        grant_binding_id,
+                        connection_digest,
+                        authorization_generation,
+                        binding_evidence_digest,
+                        created_at,
+                        updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        uuid.uuid4(),
+                        self.project.pk,
+                        self.zoom_app.pk,
+                        "1" * 64,
+                        ZoomDeauthorizationResolutionOutcomes.RESOLVED,
+                        binding.pk,
+                        self.grant.pk,
+                        operation.pk,
+                        self.grant.binding_id,
+                        self.grant.connection_digest,
+                        self.grant.authorization_generation,
+                        binding.binding_evidence_digest,
+                        database_clock_now(),
+                        database_clock_now(),
+                    ],
                 )
 
     def test_expiry_seals_permanent_event_tombstone_and_prevents_rebinding(self):

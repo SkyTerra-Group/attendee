@@ -35,7 +35,7 @@ MAX_SERVICE_CLOCK_DELTA_SECONDS = 30
 _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
-_EVENT_ID_RE = re.compile(r"^zev_[A-Za-z0-9_-]{8,251}$")
+_EVENT_ID_RE = re.compile(r"^zev_[0-9a-f]{64}$")
 
 _COMMON_CLAIMS = {
     "v",
