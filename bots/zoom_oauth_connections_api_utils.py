@@ -3,11 +3,23 @@ import logging
 import uuid
 
 import requests
+from django.conf import settings
 from django.db import IntegrityError, transaction
 
-from .models import ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from .models import (
+    ZoomOAuthApp,
+    ZoomOAuthAuthorizationGrant,
+    ZoomOAuthConnection,
+    ZoomOAuthConnectionStates,
+)
 from .serializers import CreateZoomOAuthConnectionSerializer
-from .zoom_deauthorization_grants import GrantCaptureUnavailable, capture_authorization_grant
+from .zoom_deauthorization_grants import (
+    GrantCaptureUnavailable,
+    capture_authorization_grant,
+    close_authorization_grant_for_replacement,
+    valid_provider_identity_component,
+)
+from .zoom_deauthorization_readiness import DeauthorizationReadinessError, assert_capture_ready
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +82,24 @@ def create_zoom_oauth_connection(data, project):
     except ZoomOAuthApp.DoesNotExist:
         return None, {"error": "Zoom OAuth App was not found in the authenticated project."}
 
+    # Once exact capture is enabled, or an app has an explicit clean-history
+    # baseline, a legacy callback would create untracked authorization history
+    # and could later masquerade as a complete sequence-one identity.
+    if not validated_data["zoom_oauth_app_binding"] and (
+        settings.ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE
+        or not zoom_oauth_app.legacy_history_unknown
+    ):
+        return None, {"error": "Exact Zoom OAuth app binding is required."}
+
+    # An exact binding is an explicit request to participate in signed
+    # deauthorization history. Reject it before any provider exchange unless
+    # the independent capture gate and all DB-backed prerequisites are ready.
+    if validated_data["zoom_oauth_app_binding"]:
+        try:
+            assert_capture_ready(zoom_oauth_app)
+        except DeauthorizationReadinessError:
+            return None, {"error": "Zoom authorization lineage could not be recorded safely."}
+
     # Exchange the access code for tokens
     zoom_oauth_tokens = None
     try:
@@ -108,8 +138,13 @@ def create_zoom_oauth_connection(data, project):
         return None, {"error": "Error getting user info. Please check that the access token is valid."}
 
     # Validate that the user is active
-    if user_info["status"] != "active":
+    if type(user_info) is not dict or user_info.get("status") != "active":
         return None, {"error": "The user is not active."}
+    if not valid_provider_identity_component(
+        user_info.get("id")
+    ) or not valid_provider_identity_component(user_info.get("account_id")):
+        logger.error("zoom_oauth_authorization_failed code=provider_identity_invalid")
+        return None, {"error": "Zoom returned an invalid user identity."}
 
     try:
         with transaction.atomic():
@@ -120,14 +155,41 @@ def create_zoom_oauth_connection(data, project):
                 pk=zoom_oauth_app.pk,
                 project=project,
             )
+            # Re-evaluate eligibility under the same app lock used by capture.
+            # A recovery/baseline transaction may have changed the barrier
+            # while this callback was waiting on provider I/O.
+            if not validated_data["zoom_oauth_app_binding"] and (
+                settings.ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE
+                or not zoom_oauth_app.legacy_history_unknown
+            ):
+                return None, {"error": "Exact Zoom OAuth app binding is required."}
+            if validated_data["zoom_oauth_app_binding"]:
+                try:
+                    assert_capture_ready(zoom_oauth_app)
+                except DeauthorizationReadinessError:
+                    return None, {
+                        "error": "Zoom authorization lineage could not be recorded safely."
+                    }
             zoom_oauth_connection = ZoomOAuthConnection.objects.select_for_update().filter(zoom_oauth_app=zoom_oauth_app, user_id=user_info["id"]).first()
             created = zoom_oauth_connection is None
+            replacement_boundary = None
             if created:
                 zoom_oauth_connection = ZoomOAuthConnection.objects.create(
                     zoom_oauth_app=zoom_oauth_app,
                     user_id=user_info["id"],
                     account_id=user_info["account_id"],
                 )
+            elif validated_data["zoom_oauth_app_binding"]:
+                # The DB forbids identity/generation changes while a grant is
+                # live. Close that exact interval first, then capture the new
+                # generation later in this same transaction.
+                replacement_boundary = close_authorization_grant_for_replacement(
+                    zoom_oauth_connection
+                )
+            elif ZoomOAuthAuthorizationGrant.objects.filter(
+                live_connection=zoom_oauth_connection
+            ).exists():
+                return None, {"error": "Exact Zoom OAuth app binding is required."}
 
             zoom_oauth_connection.account_id = user_info["account_id"]
             zoom_oauth_connection.metadata = validated_data["metadata"]
@@ -153,7 +215,10 @@ def create_zoom_oauth_connection(data, project):
             # Legacy callers remain compatible but cannot later gain time-only
             # signed-event authority from incomplete history.
             if validated_data["zoom_oauth_app_binding"]:
-                capture_authorization_grant(zoom_oauth_connection)
+                capture_authorization_grant(
+                    zoom_oauth_connection,
+                    replacement_boundary=replacement_boundary,
+                )
 
             return zoom_oauth_connection, None
 

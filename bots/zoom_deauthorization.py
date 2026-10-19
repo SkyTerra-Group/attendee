@@ -42,7 +42,7 @@ from bots.zoom_deauthorization_grants import (
     configured_clock_evidence,
     database_clock_now,
     expected_client_id_digest,
-    provider_identity_digest,
+    find_provider_identity_lineage,
 )
 from bots.zoom_retention import (
     RECEIPT_RETENTION_DAYS,
@@ -163,6 +163,17 @@ def _exact_app(project: Project, assertion: VerifiedDeauthorizationAssertion) ->
     if not hmac.compare_digest(expected_client_id_digest(app.client_id), configured_digest):
         raise DeauthorizationServiceError("signer_registry_invalid", status_code=401)
     return app
+
+
+def _assert_signed_app_ready(app: ZoomOAuthApp) -> None:
+    # Lazy import avoids a module cycle; the app row is already selected from
+    # authenticated project + verified signer data and locked by the caller.
+    from bots.zoom_deauthorization_readiness import DeauthorizationReadinessError, assert_signed_app_ready
+
+    try:
+        assert_signed_app_ready(app)
+    except DeauthorizationReadinessError as error:
+        raise DeauthorizationServiceError(error.code, status_code=503) from None
 
 
 def _binding_recovery(binding: ZoomDeauthorizationEventBinding) -> dict:
@@ -535,6 +546,7 @@ def resolve_verified_deauthorization(project: Project, assertion: VerifiedDeauth
     claims = assertion.claims
     with transaction.atomic():
         app = _exact_app(project, assertion)
+        _assert_signed_app_ready(app)
         _event_lock(project.pk, app.pk, assertion.event_digest)
         _nonce_lock(project.pk, app.pk, assertion.claims["iss"], assertion.nonce_digest)
         _assert_nonce_unused(project, app, assertion)
@@ -570,12 +582,16 @@ def resolve_verified_deauthorization(project: Project, assertion: VerifiedDeauth
 
         if not hmac.compare_digest(expected_client_id_digest(claims["zoom_client_id"]), assertion.signer["expected_client_id_digest"]):
             raise DeauthorizationServiceError("scope_not_found", status_code=404)
-        identity_digest = provider_identity_digest(project, app, claims["zoom_user_id"], claims["zoom_account_id"])
-        lineage = (
-            ZoomOAuthAuthorizationLineage.objects.select_for_update()
-            .filter(project=project, zoom_oauth_app=app, identity_digest=identity_digest)
-            .first()
-        )
+        try:
+            lineage, _identity_candidates = find_provider_identity_lineage(
+                project,
+                app,
+                claims["zoom_user_id"],
+                claims["zoom_account_id"],
+                for_update=True,
+            )
+        except GrantCaptureUnavailable as error:
+            raise DeauthorizationServiceError(error.args[0], status_code=409) from None
         if lineage is None:
             resolution = ZoomDeauthorizationTargetResolution.objects.create(
                 project=project,
@@ -713,6 +729,7 @@ def settle_verified_deauthorization(project: Project, assertion: VerifiedDeautho
     claims = assertion.claims
     with transaction.atomic():
         app = _exact_app(project, assertion)
+        _assert_signed_app_ready(app)
         _event_lock(project.pk, app.pk, assertion.event_digest)
         _nonce_lock(project.pk, app.pk, assertion.claims["iss"], assertion.nonce_digest)
         _assert_nonce_unused(project, app, assertion)

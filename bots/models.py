@@ -290,6 +290,13 @@ class ZoomOAuthApp(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     last_verified_webhook_received_at = models.DateTimeField(null=True, blank=True)
     last_unverified_webhook_received_at = models.DateTimeField(null=True, blank=True)
+    # Existing apps begin behind a permanent unknown-history barrier. A clean
+    # baseline may be established only while an app has no connections or
+    # lineage rows; the database trigger enforces that transition.
+    legacy_history_unknown = models.BooleanField(default=True)
+    authorization_history_baseline_at = models.DateTimeField(null=True, blank=True)
+    legacy_recovery_completed_at = models.DateTimeField(null=True, blank=True)
+    legacy_recovery_ring_fingerprint = models.CharField(max_length=64, null=True, blank=True)
 
     @property
     def client_secret(self):
@@ -327,6 +334,24 @@ class ZoomOAuthApp(models.Model):
 
     def __str__(self):
         return f"{self.project.name} - {self.object_id} - {self.client_id}"
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(legacy_history_unknown=True, authorization_history_baseline_at__isnull=True)
+                    | models.Q(legacy_history_unknown=False, authorization_history_baseline_at__isnull=False)
+                ),
+                name="zoom_app_history_baseline_shape",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(legacy_recovery_completed_at__isnull=True, legacy_recovery_ring_fingerprint__isnull=True)
+                    | models.Q(legacy_recovery_completed_at__isnull=False, legacy_recovery_ring_fingerprint__isnull=False)
+                ),
+                name="zoom_app_legacy_recovery_marker_shape",
+            ),
+        ]
 
 
 class ZoomOAuthConnectionStates(models.IntegerChoices):
@@ -423,6 +448,15 @@ class ZoomOAuthAuthorizationLineage(models.Model):
     project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="zoom_oauth_authorization_lineages")
     zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="authorization_lineages")
     identity_digest = models.CharField(max_length=64)
+    identity_audit_key_id = models.CharField(max_length=64, null=True, blank=True)
+    identity_audit_key_fingerprint = models.CharField(max_length=64, null=True, blank=True)
+    legacy_predecessor = models.OneToOneField(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="recovered_lineage",
+    )
     latest_grant_sequence = models.PositiveIntegerField(default=0)
     has_prior_grant = models.BooleanField(default=False)
     history_complete = models.BooleanField(default=False)
@@ -438,6 +472,18 @@ class ZoomOAuthAuthorizationLineage(models.Model):
             models.CheckConstraint(
                 condition=models.Q(latest_grant_sequence__gte=0),
                 name="zoom_lineage_sequence_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(identity_audit_key_id__isnull=False, identity_audit_key_fingerprint__isnull=False)
+                    | models.Q(
+                        identity_audit_key_id__isnull=True,
+                        identity_audit_key_fingerprint__isnull=True,
+                        history_complete=False,
+                        has_prior_grant=True,
+                    )
+                ),
+                name="zoom_lineage_unkeyed_is_incomplete",
             ),
         ]
 
@@ -458,7 +504,20 @@ class ZoomOAuthAuthorizationGrant(models.Model):
         related_name="authorization_grant",
     )
     connection_digest = models.CharField(max_length=64)
+    connection_audit_key_id = models.CharField(max_length=64, null=True, blank=True)
+    connection_audit_key_fingerprint = models.CharField(max_length=64, null=True, blank=True)
     identity_digest = models.CharField(max_length=64)
+    identity_audit_key_id = models.CharField(max_length=64, null=True, blank=True)
+    identity_audit_key_fingerprint = models.CharField(max_length=64, null=True, blank=True)
+    legacy_recovery_outcome = models.CharField(
+        max_length=32,
+        choices=[
+            ("successor_linked", "Successor linked"),
+            ("unrecoverable", "Unrecoverable"),
+        ],
+        null=True,
+        blank=True,
+    )
     authorization_generation = models.UUIDField()
     generation_started_at = models.DateTimeField()
     generation_ended_at = models.DateTimeField(null=True, blank=True)
@@ -493,14 +552,76 @@ class ZoomOAuthAuthorizationGrant(models.Model):
             ),
             models.CheckConstraint(
                 condition=(
+                    models.Q(live_connection__isnull=True)
+                    | models.Q(generation_ended_at__isnull=True)
+                ),
+                name="zoom_grant_live_connection_is_open",
+            ),
+            models.CheckConstraint(
+                condition=(
                     models.Q(generation_ended_at__isnull=True, end_clock_health_id__isnull=True, end_clock_error_ms__isnull=True, end_clock_continuous__isnull=True)
                     | models.Q(generation_ended_at__isnull=False, end_clock_health_id__isnull=False, end_clock_error_ms__isnull=False, end_clock_continuous__isnull=False)
                 ),
                 name="zoom_grant_end_evidence_complete",
             ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        identity_audit_key_id__isnull=False,
+                        identity_audit_key_fingerprint__isnull=False,
+                        connection_audit_key_id__isnull=False,
+                        connection_audit_key_fingerprint__isnull=False,
+                        legacy_recovery_outcome__isnull=True,
+                    )
+                    | models.Q(
+                        identity_audit_key_id__isnull=True,
+                        identity_audit_key_fingerprint__isnull=True,
+                        connection_audit_key_id__isnull=True,
+                        connection_audit_key_fingerprint__isnull=True,
+                        legacy_history=True,
+                    )
+                ),
+                name="zoom_grant_audit_key_ids_complete",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(legacy_recovery_outcome__isnull=True)
+                    | models.Q(legacy_recovery_outcome__in=["successor_linked", "unrecoverable"])
+                ),
+                name="zoom_grant_legacy_recovery_outcome_valid",
+            ),
         ]
         indexes = [
             models.Index(fields=["project", "zoom_oauth_app", "identity_digest"], name="zoom_grant_identity_idx"),
+        ]
+
+
+class ZoomRemovalAuditKeyFingerprint(models.Model):
+    """Permanent non-secret registry preventing audit-key ID material reuse."""
+
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="zoom_removal_audit_key_fingerprints")
+    zoom_oauth_app = models.ForeignKey(
+        ZoomOAuthApp,
+        on_delete=models.PROTECT,
+        related_name="audit_key_fingerprints",
+    )
+    key_id = models.CharField(max_length=64)
+    key_fingerprint = models.CharField(max_length=64)
+    algorithm = models.CharField(max_length=32, default="HMAC-SHA-256")
+    derivation_domain = models.CharField(max_length=64, default="attendee-zoom-removal-audit-v1")
+    derivation_version = models.PositiveSmallIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "zoom_oauth_app", "key_id"],
+                name="zoom_audit_key_registry_scope_kid_unique",
+            ),
+            models.UniqueConstraint(
+                fields=["key_fingerprint"],
+                name="zoom_audit_key_registry_fingerprint_unique",
+            ),
         ]
 
 

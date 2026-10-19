@@ -138,7 +138,13 @@ def _canonical_uuid(value, code: str) -> str:
 
 
 def _bounded_string(value, code: str, *, maximum: int = 255, pattern=None) -> str:
-    if type(value) is not str or not value or len(value.encode("utf-8")) > maximum:
+    if type(value) is not str or not value:
+        raise AssertionRejected(code)
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise AssertionRejected(code) from None
+    if len(encoded) > maximum:
         raise AssertionRejected(code)
     if any(unicodedata.category(character).startswith("C") for character in value):
         raise AssertionRejected(code)
@@ -189,12 +195,13 @@ def _select_signer(project_object_id: str, unverified_claims: dict, header: dict
         or signer["zoom_oauth_app_id"] <= 0
         or type(signer.get("expected_client_id_digest")) is not str
         or not _HEX64_RE.fullmatch(signer["expected_client_id_digest"])
-        or type(signer.get("audience")) is not str
-        or not signer["audience"]
-        or len(signer["audience"].encode("utf-8")) > 512
-        or any(unicodedata.category(character).startswith("C") for character in signer["audience"])
     ):
         raise AssertionRejected("signer_registry_invalid")
+    _bounded_string(
+        signer.get("audience"),
+        "signer_registry_invalid",
+        maximum=512,
+    )
     public_key = signer["keys"].get(kid)
     if type(public_key) is not str:
         raise AssertionRejected("unknown_key")

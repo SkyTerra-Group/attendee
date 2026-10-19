@@ -54,12 +54,19 @@ CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
 # The Zoom removal API is intentionally unreachable until the cross-service
 # retention flow has passed its integrated staging and wording gates.
 ENABLE_ZOOM_RETENTION_REMOVAL_API = os.getenv("ENABLE_ZOOM_RETENTION_REMOVAL_API", "false").lower() == "true"
+# Exact-app OAuth grant capture has its own false-default gate.  A caller
+# sending a binding while this is off is rejected instead of silently creating
+# history that later appears complete.
+ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE = os.getenv(
+    "ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE", "false"
+).lower() == "true"
 
 # Purpose-bound signed deauthorization trust.  The registry contains public
-# keys and exact project/app/issuer/audience bindings only.  The audit key is a
-# separate secret used solely for non-readable identity lineage digests.
+# keys and exact project/app/issuer/audience bindings only.  The audit-key ring
+# is a separate secret used solely for non-readable identity and connection
+# digests.  No legacy singular-key fallback is permitted.
 ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON = os.getenv("ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON", "{}")
-ZOOM_REMOVAL_AUDIT_KEY = os.getenv("ZOOM_REMOVAL_AUDIT_KEY")
+ZOOM_REMOVAL_AUDIT_KEYRING_JSON = os.getenv("ZOOM_REMOVAL_AUDIT_KEYRING_JSON", "{}")
 ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID = os.getenv("ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID", "")
 ZOOM_DEAUTH_DB_CLOCK_ERROR_MS = int(os.getenv("ZOOM_DEAUTH_DB_CLOCK_ERROR_MS", "1001"))
 ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS = os.getenv("ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS", "false").lower() == "true"
