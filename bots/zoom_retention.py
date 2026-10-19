@@ -14,12 +14,15 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 import requests
+from botocore.exceptions import ClientError
 from django.conf import settings
 from django.core.files.storage import storages
 from django.db import IntegrityError, transaction
 from django.db import connection as database_connection
 from django.db.models import F
 from django.utils import timezone
+from storages.backends.s3 import S3Storage
+from storages.utils import clean_name
 
 from bots.bot_runtime_fence import confirm_bot_runtime_absence
 from bots.models import (
@@ -770,6 +773,24 @@ def _list_storage_tree(storage, prefix: str) -> list[str]:
     return found
 
 
+def _storage_object_exists(storage, name: str) -> bool:
+    if not isinstance(storage, S3Storage):
+        return storage.exists(name)
+    # django-storages 1.14.4's exists() skips HEAD and returns False when
+    # file_overwrite=True. That upload optimization is not deletion evidence.
+    client = storage.connection.meta.client
+    key = storage._normalize_name(clean_name(name))
+    try:
+        client.head_object(Bucket=storage.bucket_name, Key=key)
+    except ClientError as error:
+        if error.response.get("ResponseMetadata", {}).get("HTTPStatusCode") != 404:
+            raise
+        # A missing/inaccessible bucket is not verified object absence.
+        client.head_bucket(Bucket=storage.bucket_name)
+        return False
+    return True
+
+
 def _delete_and_verify_storage(manifest: dict) -> None:
     exact_groups = (
         (storages["recordings"], manifest.get("recordings", [])),
@@ -781,12 +802,14 @@ def _delete_and_verify_storage(manifest: dict) -> None:
             storage.delete(name)
 
     audio_storage = storages["audio_chunks"]
+    discovered_audio = set()
     for prefix in manifest.get("audio_prefixes", []):
         for name in _list_storage_tree(audio_storage, prefix):
+            discovered_audio.add(name)
             audio_storage.delete(name)
 
-    for storage, names in exact_groups:
-        if any(storage.exists(name) for name in names):
+    for storage, names in (*exact_groups, (audio_storage, sorted(discovered_audio))):
+        if any(_storage_object_exists(storage, name) for name in names):
             raise StorageVerificationError()
     if any(_list_storage_tree(audio_storage, prefix) for prefix in manifest.get("audio_prefixes", [])):
         raise StorageVerificationError()
