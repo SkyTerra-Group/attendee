@@ -1082,8 +1082,8 @@ class BotController:
         # Run the main loop
         try:
             self.main_loop.run()
-        except Exception as e:
-            logger.warning(f"Error in bot {self.bot_in_db.id}: {str(e)}")
+        except Exception:
+            logger.warning("runtime_main_loop_failed code=runtime_error")
             self.cleanup()
         finally:
             # Clean up Redis subscription

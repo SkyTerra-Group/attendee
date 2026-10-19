@@ -485,9 +485,11 @@ class ZoomBotAdapter(BotAdapter):
 
         init_param.strWebDomain = "https://zoom.us"
         init_param.strSupportUrl = "https://zoom.us"
-        init_param.enableGenerateDump = True
+        # Native artifacts bypass Python's configured log filters. Disable
+        # optional logs/dumps; this is not a guarantee of silent SDK stdout.
+        init_param.enableGenerateDump = False
         init_param.emLanguageID = zoom.SDK_LANGUAGE_ID.LANGUAGE_English
-        init_param.enableLogByDefault = True
+        init_param.enableLogByDefault = False
 
         init_sdk_result = zoom.InitSDK(init_param)
         if init_sdk_result != zoom.SDKERR_SUCCESS:
