@@ -70,6 +70,11 @@ ZOOM_REMOVAL_AUDIT_KEYRING_JSON = os.getenv("ZOOM_REMOVAL_AUDIT_KEYRING_JSON", "
 ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID = os.getenv("ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID", "")
 ZOOM_DEAUTH_DB_CLOCK_ERROR_MS = int(os.getenv("ZOOM_DEAUTH_DB_CLOCK_ERROR_MS", "1001"))
 ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS = os.getenv("ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS", "false").lower() == "true"
+# v3 per-operation measurement policy. Absent/invalid = no fresh admission.
+# The v2 static declaration above is no longer accepted as clock proof.
+ZOOM_DEAUTH_CLOCK_SOURCE_POLICY_ID = os.getenv("ZOOM_DEAUTH_CLOCK_SOURCE_POLICY_ID", "")
+ZOOM_DEAUTH_CLOCK_MAX_SAMPLE_ERROR_MS = os.getenv("ZOOM_DEAUTH_CLOCK_MAX_SAMPLE_ERROR_MS", "")
+ZOOM_DEAUTH_CLOCK_MAX_RTT_MS = os.getenv("ZOOM_DEAUTH_CLOCK_MAX_RTT_MS", "")
 
 AUTH_USER_MODEL = "accounts.User"
 

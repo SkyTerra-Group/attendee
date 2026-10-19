@@ -16,7 +16,8 @@ from bots.models import (
 )
 from bots.zoom_deauthorization_grants import (
     GrantCaptureUnavailable,
-    configured_clock_evidence,
+    NO_STATIC_CLOCK_CLAIM,
+    NO_STATIC_CLOCK_ERROR_MS,
     connection_binding_candidates,
     database_clock_now,
     provider_identity_candidates,
@@ -91,7 +92,6 @@ class Command(BaseCommand):
                 if any(binding not in app_by_binding for binding in baseline_bindings):
                     raise CommandError("app_binding_not_found")
 
-                clock = configured_clock_evidence()
                 for app in scoped_apps:
                     ring = configured_audit_keyring(app.project, app)
                     legacy_grants = list(
@@ -187,9 +187,11 @@ class Command(BaseCommand):
                                 if boundary <= legacy_grant.generation_started_at:
                                     raise CommandError("grant_boundary_invalid")
                                 legacy_grant.generation_ended_at = boundary
-                                legacy_grant.end_clock_health_id = clock.health_id
-                                legacy_grant.end_clock_error_ms = clock.error_ms
-                                legacy_grant.end_clock_continuous = clock.continuous
+                                # Legacy grants are never fresh-eligible: record an
+                                # explicit non-claim, not a static clock declaration.
+                                legacy_grant.end_clock_health_id = NO_STATIC_CLOCK_CLAIM
+                                legacy_grant.end_clock_error_ms = NO_STATIC_CLOCK_ERROR_MS
+                                legacy_grant.end_clock_continuous = False
                             legacy_grant.live_connection = None
                             legacy_grant.legacy_recovery_outcome = outcome
                             legacy_grant.save(

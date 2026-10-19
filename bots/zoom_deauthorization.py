@@ -34,12 +34,15 @@ from bots.models import (
 from bots.zoom_deauthorization_assertion import (
     CREATE_IF_FRESH,
     EXISTING_ONLY,
+    CLOCK_MEASUREMENT_POLICY,
+    CREATE_IF_FRESH,
     TEMPORAL_POLICY,
+    TEMPORAL_POLICY_V2,
     VerifiedDeauthorizationAssertion,
 )
 from bots.zoom_deauthorization_grants import (
     GrantCaptureUnavailable,
-    configured_clock_evidence,
+    sample_database_clock,
     database_clock_now,
     expected_client_id_digest,
     find_provider_identity_lineage,
@@ -86,6 +89,33 @@ _EVIDENCE_SNAPSHOT_FIELDS = {
     "attendee_receipt_clock_health_id",
     "attendee_receipt_clock_error_ms",
     "attendee_receipt_clock_continuous",
+    "grant_binding_id",
+    "connection_generation",
+    "lineage_sequence",
+    "history_complete",
+    "has_prior_grant",
+}
+
+# v3 snapshot: operation-coupled sampled error bounds only; no field states or
+# implies continuous/step-free clock semantics.
+_V3_EVIDENCE_SNAPSHOT_FIELDS = {
+    "temporal_policy",
+    "zoom_event_at",
+    "zoom_request_signed_at",
+    "first_verified_at",
+    "binding_attempt_iat",
+    "attendee_binding_received_at",
+    "zoom_event_precision_ms",
+    "zoom_request_precision_ms",
+    "generation_started_at",
+    "generation_ended_at",
+    "clock_measurement_policy",
+    "client_clock_source_policy_id",
+    "client_receipt_clock_error_ms",
+    "client_issuance_clock_error_ms",
+    "attendee_clock_source_policy_id",
+    "attendee_boundary_clock_error_ms",
+    "attendee_binding_clock_error_ms",
     "grant_binding_id",
     "connection_generation",
     "lineage_sequence",
@@ -187,18 +217,28 @@ def _binding_recovery(binding: ZoomDeauthorizationEventBinding) -> dict:
 def _validate_existing_binding_claims(binding: ZoomDeauthorizationEventBinding, assertion: VerifiedDeauthorizationAssertion) -> None:
     claims = assertion.claims
     snapshot = binding.evidence_snapshot
+    # A binding is recovered only by claims of the policy it was bound under.
+    if claims["temporal_policy"] != binding.temporal_policy:
+        raise DeauthorizationServiceError("event_binding_conflict")
     immutable = {
         "zoom_event_at": claims["zoom_event_at"],
         "zoom_request_signed_at": claims["zoom_request_signed_at"],
         "first_verified_at": claims["first_verified_at"],
         "zoom_event_precision_ms": claims["zoom_event_precision_ms"],
         "zoom_request_precision_ms": claims["zoom_request_precision_ms"],
-        "client_clock_health_id": claims["client_clock_health_id"],
-        "client_clock_continuous": claims["client_clock_continuous"],
-        "client_clock_step_free": claims["client_clock_step_free"],
-        "client_clock_error_ms": claims["client_clock_error_ms"],
     }
-    if type(snapshot) is not dict or set(snapshot) != _EVIDENCE_SNAPSHOT_FIELDS:
+    if binding.temporal_policy == TEMPORAL_POLICY_V2:
+        fields = _EVIDENCE_SNAPSHOT_FIELDS
+        immutable.update({name: claims[name] for name in (
+            "client_clock_health_id", "client_clock_continuous", "client_clock_step_free", "client_clock_error_ms")})
+    elif binding.temporal_policy == TEMPORAL_POLICY:
+        fields = _V3_EVIDENCE_SNAPSHOT_FIELDS
+        # Issuance error differs per assertion; the receipt sample does not.
+        immutable.update({name: claims[name] for name in (
+            "clock_measurement_policy", "client_clock_source_policy_id", "client_receipt_clock_error_ms")})
+    else:
+        raise DeauthorizationServiceError("event_binding_conflict")
+    if type(snapshot) is not dict or set(snapshot) != fields:
         raise DeauthorizationServiceError("event_binding_conflict")
     if any(snapshot.get(name) != value for name, value in immutable.items()):
         raise DeauthorizationServiceError("event_binding_conflict")
@@ -222,7 +262,9 @@ def _validate_existing_binding_claims(binding: ZoomDeauthorizationEventBinding, 
 def _candidate_snapshot(
     assertion: VerifiedDeauthorizationAssertion,
     grant: ZoomOAuthAuthorizationGrant,
-    receipt_clock,
+    start_sample,
+    end_sample,
+    binding_sample,
 ) -> dict:
     claims = assertion.claims
     return {
@@ -231,21 +273,19 @@ def _candidate_snapshot(
         "zoom_request_signed_at": claims["zoom_request_signed_at"],
         "first_verified_at": claims["first_verified_at"],
         "binding_attempt_iat": claims["iat"],
-        "attendee_binding_received_at": _utc_iso(assertion.received_at),
+        # The sampled provider binding instant, not a later unsampled now().
+        "attendee_binding_received_at": _utc_iso(binding_sample.db_at),
         "zoom_event_precision_ms": claims["zoom_event_precision_ms"],
         "zoom_request_precision_ms": claims["zoom_request_precision_ms"],
         "generation_started_at": _utc_iso(grant.generation_started_at),
         "generation_ended_at": _utc_iso(grant.generation_ended_at),
-        "client_clock_health_id": claims["client_clock_health_id"],
-        "client_clock_continuous": claims["client_clock_continuous"],
-        "client_clock_step_free": claims["client_clock_step_free"],
-        "client_clock_error_ms": claims["client_clock_error_ms"],
-        "attendee_boundary_clock_health_ids": [grant.start_clock_health_id, grant.end_clock_health_id],
-        "attendee_boundary_clock_error_ms": [grant.start_clock_error_ms, grant.end_clock_error_ms],
-        "attendee_boundary_clock_continuous": [grant.start_clock_continuous, grant.end_clock_continuous],
-        "attendee_receipt_clock_health_id": receipt_clock.health_id,
-        "attendee_receipt_clock_error_ms": receipt_clock.error_ms,
-        "attendee_receipt_clock_continuous": receipt_clock.continuous,
+        "clock_measurement_policy": CLOCK_MEASUREMENT_POLICY,
+        "client_clock_source_policy_id": claims["client_clock_source_policy_id"],
+        "client_receipt_clock_error_ms": claims["client_receipt_clock_error_ms"],
+        "client_issuance_clock_error_ms": claims["client_issuance_clock_error_ms"],
+        "attendee_clock_source_policy_id": binding_sample.source_policy_id,
+        "attendee_boundary_clock_error_ms": [start_sample.error_ms, end_sample.error_ms if end_sample else None],
+        "attendee_binding_clock_error_ms": binding_sample.error_ms,
         "grant_binding_id": str(grant.binding_id),
         "connection_generation": str(grant.authorization_generation),
         "lineage_sequence": grant.grant_sequence,
@@ -255,9 +295,19 @@ def _candidate_snapshot(
 
 
 def candidate_temporal_evidence_digest(snapshot: dict) -> str:
-    # This ordered list is the cross-repository wire contract in revision 4.
-    # Additional validated health/error fields remain frozen in the snapshot,
-    # but do not silently change this byte-exact digest contract.
+    if snapshot["temporal_policy"] == TEMPORAL_POLICY:
+        # v3 cross-repository wire contract: every sampled bound is digested.
+        ordered = [snapshot[name] for name in (
+            "temporal_policy", "zoom_event_at", "zoom_request_signed_at", "first_verified_at",
+            "binding_attempt_iat", "attendee_binding_received_at", "zoom_event_precision_ms",
+            "zoom_request_precision_ms", "generation_started_at", "generation_ended_at",
+            "clock_measurement_policy", "client_clock_source_policy_id", "client_receipt_clock_error_ms",
+            "client_issuance_clock_error_ms", "attendee_clock_source_policy_id",
+            "attendee_boundary_clock_error_ms", "attendee_binding_clock_error_ms", "grant_binding_id",
+            "connection_generation", "lineage_sequence", "history_complete")]
+        return hashlib.sha256(_canonical_json(ordered)).hexdigest()
+    # This ordered list is the v2 wire contract in revision 4, retained only
+    # to verify already-recorded v2 bindings.
     ordered = [
         snapshot["temporal_policy"],
         snapshot["zoom_event_at"],
@@ -284,6 +334,9 @@ def binding_temporal_evidence_digest(candidate_digest: str, binding_id, binding_
 
 def _fresh_binding_evidence(assertion: VerifiedDeauthorizationAssertion, grant: ZoomOAuthAuthorizationGrant):
     claims = assertion.claims
+    # Only v3 sampled claims may create; v2 static declarations never can.
+    if claims["temporal_policy"] != TEMPORAL_POLICY or claims["binding_mode"] != CREATE_IF_FRESH:
+        raise DeauthorizationServiceError("clock_untrusted")
     times = [claims["zoom_event_at"], claims["zoom_request_signed_at"], claims["first_verified_at"], claims["iat"]]
     if claims["zoom_event_at"] > claims["zoom_request_signed_at"]:
         raise DeauthorizationServiceError("unresolved_temporal_order")
@@ -298,24 +351,30 @@ def _fresh_binding_evidence(assertion: VerifiedDeauthorizationAssertion, grant: 
         or grant.legacy_history
     ):
         raise DeauthorizationServiceError("unresolved_provider_clock")
-    try:
-        receipt_clock = configured_clock_evidence()
-    except GrantCaptureUnavailable:
-        raise DeauthorizationServiceError("clock_untrusted") from None
-    boundary_continuous = grant.start_clock_continuous and (
-        grant.generation_ended_at is None or grant.end_clock_continuous is True
-    )
-    boundary_ids = [grant.start_clock_health_id]
-    if grant.generation_ended_at is not None:
-        boundary_ids.append(grant.end_clock_health_id)
-    boundary_error = max(grant.start_clock_error_ms, grant.end_clock_error_ms or 0, receipt_clock.error_ms)
+    # Provider fresh-binding sample on this exact transaction's connection.
+    binding_sample, _code = sample_database_clock()
+    if binding_sample is None:
+        raise DeauthorizationServiceError("clock_untrusted")
+    times.append(int(binding_sample.db_at.timestamp()))
+    if max(times) - min(times) > MAX_FRESH_SPAN_SECONDS:
+        raise DeauthorizationServiceError("delayed_event_unbound")
+    samples = {sample.boundary: sample for sample in grant.clock_samples.all()}
+    start_sample, end_sample = samples.get("start"), samples.get("end")
     if (
-        not boundary_continuous
-        or not grant.start_clock_health_id
-        or (grant.generation_ended_at is not None and not grant.end_clock_health_id)
-        or any(boundary_id != receipt_clock.health_id for boundary_id in boundary_ids)
-        or claims["client_clock_error_ms"] + boundary_error > MAX_COMBINED_CLOCK_ERROR_MS
+        # Grants recorded without boundary samples are never upgraded.
+        start_sample is None
+        or start_sample.sampled_at != grant.generation_started_at
+        or (grant.generation_ended_at is not None and (end_sample is None or end_sample.sampled_at != grant.generation_ended_at))
+        or (grant.generation_ended_at is None and end_sample is not None)
+        or any(
+            sample.measurement_policy != CLOCK_MEASUREMENT_POLICY or sample.source_policy_id != binding_sample.source_policy_id
+            for sample in samples.values()
+        )
     ):
+        raise DeauthorizationServiceError("clock_untrusted")
+    client_error = max(claims["client_receipt_clock_error_ms"], claims["client_issuance_clock_error_ms"])
+    provider_error = max(start_sample.error_ms, end_sample.error_ms if end_sample else 0, binding_sample.error_ms)
+    if client_error + provider_error > MAX_COMBINED_CLOCK_ERROR_MS:
         raise DeauthorizationServiceError("clock_untrusted")
     event_at = _datetime_from_epoch(claims["zoom_event_at"])
     lower = event_at - timedelta(seconds=U_SECONDS)
@@ -324,7 +383,7 @@ def _fresh_binding_evidence(assertion: VerifiedDeauthorizationAssertion, grant: 
         raise DeauthorizationServiceError("unresolved_temporal_order")
     if grant.generation_ended_at is not None and not upper < grant.generation_ended_at:
         raise DeauthorizationServiceError("unresolved_temporal_order")
-    snapshot = _candidate_snapshot(assertion, grant, receipt_clock)
+    snapshot = _candidate_snapshot(assertion, grant, start_sample, end_sample, binding_sample)
     return snapshot, candidate_temporal_evidence_digest(snapshot)
 
 

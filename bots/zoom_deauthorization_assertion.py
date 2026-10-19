@@ -23,7 +23,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from django.conf import settings
 
 ASSERTION_TYP = "skyterra-zoom-deauthorization+jwt"
-TEMPORAL_POLICY = "first-grant-fresh30-u62-v2"
+# v2 trusted static continuous/step_free declarations and is accepted only for
+# existing_only recovery of already-recorded receipts. v3 carries
+# operation-coupled sampled error bounds (a measurement policy, not a claim
+# that any clock is continuous or step-free).
+TEMPORAL_POLICY_V2 = "first-grant-fresh30-u62-v2"
+TEMPORAL_POLICY = "first-grant-sampled-u62-v3"
+CLOCK_MEASUREMENT_POLICY = "operation-sampled-utc-bound-v1"
 SETTLE_PURPOSE = "zoom-deauthorization:settle"
 RESOLVE_PURPOSE = "zoom-deauthorization:resolve"
 CREATE_IF_FRESH = "create_if_fresh"
@@ -52,14 +58,22 @@ _COMMON_CLAIMS = {
     "zoom_event_precision_ms",
     "zoom_request_precision_ms",
     "temporal_policy",
-    "client_clock_health_id",
-    "client_clock_continuous",
-    "client_clock_step_free",
-    "client_clock_error_ms",
     "iat",
     "nbf",
     "exp",
     "jti",
+}
+_V2_CLOCK_CLAIMS = {
+    "client_clock_health_id",
+    "client_clock_continuous",
+    "client_clock_step_free",
+    "client_clock_error_ms",
+}
+_V3_CLOCK_CLAIMS = {
+    "clock_measurement_policy",
+    "client_clock_source_policy_id",
+    "client_receipt_clock_error_ms",
+    "client_issuance_clock_error_ms",
 }
 _SETTLE_CLAIMS = _COMMON_CLAIMS | {
     "operation_id",
@@ -214,6 +228,7 @@ def _select_signer(project_object_id: str, unverified_claims: dict, header: dict
 
 def _validate_claim_schema(claims: dict, purpose: str) -> None:
     expected = _SETTLE_CLAIMS if purpose == SETTLE_PURPOSE else _RESOLVE_CLAIMS
+    expected = expected | (_V2_CLOCK_CLAIMS if claims.get("temporal_policy") == TEMPORAL_POLICY_V2 else _V3_CLOCK_CLAIMS)
     if purpose == SETTLE_PURPOSE and "resolution_id" in claims:
         expected = expected | {"resolution_id"}
     if set(claims) != expected:
@@ -233,17 +248,32 @@ def _validate_common_claims(claims: dict, signer: dict, project_object_id: str, 
         raise AssertionRejected("app_binding_invalid")
     if claims.get("binding_mode") not in {CREATE_IF_FRESH, EXISTING_ONLY}:
         raise AssertionRejected("binding_mode_invalid")
-    if claims.get("temporal_policy") != TEMPORAL_POLICY:
+    if claims.get("temporal_policy") not in {TEMPORAL_POLICY_V2, TEMPORAL_POLICY}:
         raise AssertionRejected("temporal_policy_invalid")
     _bounded_string(claims.get("zoom_event_id"), "event_id_invalid", pattern=_EVENT_ID_RE)
     for name in ("zoom_event_at", "zoom_request_signed_at", "first_verified_at", "iat", "nbf", "exp"):
         _integer(claims.get(name), f"{name}_invalid", minimum=0)
     _integer(claims.get("zoom_event_precision_ms"), "event_precision_invalid", minimum=1, maximum=1000)
     _integer(claims.get("zoom_request_precision_ms"), "request_precision_invalid", minimum=1, maximum=1000)
-    _bounded_string(claims.get("client_clock_health_id"), "clock_health_invalid", maximum=64, pattern=_SAFE_ID_RE)
-    if claims.get("client_clock_continuous") is not True or claims.get("client_clock_step_free") is not True:
-        raise AssertionRejected("clock_untrusted")
-    _integer(claims.get("client_clock_error_ms"), "clock_error_invalid", minimum=0, maximum=1000)
+    if claims["temporal_policy"] == TEMPORAL_POLICY_V2:
+        # Recorded v2 receipts recover existing bindings only; a static
+        # declaration can never create a fresh binding.
+        if claims["binding_mode"] != EXISTING_ONLY:
+            raise AssertionRejected("clock_untrusted")
+        _bounded_string(claims.get("client_clock_health_id"), "clock_health_invalid", maximum=64, pattern=_SAFE_ID_RE)
+        if claims.get("client_clock_continuous") is not True or claims.get("client_clock_step_free") is not True:
+            raise AssertionRejected("clock_untrusted")
+        _integer(claims.get("client_clock_error_ms"), "clock_error_invalid", minimum=0, maximum=1000)
+    else:
+        if claims.get("clock_measurement_policy") != CLOCK_MEASUREMENT_POLICY:
+            raise AssertionRejected("clock_untrusted")
+        fresh = claims["binding_mode"] == CREATE_IF_FRESH
+        if fresh or claims.get("client_clock_source_policy_id") is not None:
+            _bounded_string(claims.get("client_clock_source_policy_id"), "clock_source_invalid", maximum=64, pattern=_SAFE_ID_RE)
+        for name in ("client_receipt_clock_error_ms", "client_issuance_clock_error_ms"):
+            # Missing samples are permitted only for existing_only recovery.
+            if fresh or claims.get(name) is not None:
+                _integer(claims.get(name), "clock_error_invalid", minimum=0, maximum=1000)
     _canonical_uuid(claims.get("jti"), "nonce_invalid")
     if not (claims["nbf"] <= claims["iat"] < claims["exp"]):
         raise AssertionRejected("assertion_time_invalid")

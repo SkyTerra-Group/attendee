@@ -23,7 +23,7 @@ from bots.models import (
     ZoomRemovalAuditKeyFingerprint,
 )
 from bots.zoom_deauthorization_assertion import _registry
-from bots.zoom_deauthorization_grants import GrantCaptureUnavailable, configured_clock_evidence, expected_client_id_digest
+from bots.zoom_deauthorization_grants import GrantCaptureUnavailable, configured_clock_policy, expected_client_id_digest
 from bots.zoom_removal_audit import (
     AUDIT_KEY_ALGORITHM,
     AUDIT_KEY_DERIVATION_DOMAIN,
@@ -58,6 +58,7 @@ _REQUIRED_MIGRATIONS = {
 # initially-deferred, UPDATE-OF columns).  This prevents an enabled same-name
 # no-op or INSERT/UPDATE-only replacement from satisfying readiness.
 _REQUIRED_TRIGGERS = {
+    ("bots_zoomoauthauthorizationgrantclocksample", "zoom_deauth_grant_clock_sample_immutable"): (23, "bots_zoomdeauth_grant_clock_sample_immutable", "4bd4d8e86c71df217a708904028161ab4862a7afaa66d986db8bee5deff20607", False, False, False, ()),
     ("bots_zoomdeauthorizationassertionreceipt", "zoom_deauth_receipt_immutable"): (19, "bots_zoomdeauth_receipt_immutable", "c7f939d9c8727dcb57775a0972751dea9877a614ff10a6eef6378be9b46531b5", False, False, False, ()),
     ("bots_zoomdeauthorizationassertionreceipt", "zoom_deauth_receipt_scoped_links"): (23, "bots_zoomdeauth_receipt_scope", "bc609c744eed19e734e5502b21eef9d4f31dc6137aebf7f8631a30cc1dd78d4f", False, False, False, ()),
     ("bots_zoomdeauthorizationeventbinding", "zoom_deauth_binding_event_digest_consistency"): (23, "bots_zoomdeauth_operation_event_digest_consistent", "02a47bb4c9a3761e012a519d4c47822aca622cf6c18a6ad72f836143658bc66f", False, False, False, ("operation_id", "event_digest")),
@@ -656,28 +657,9 @@ def _validate_app_audit_state(
         ):
             _fail("grant_binding_invalid")
 
-    attendee_budget = clock.error_ms if clock is not None else None
-    if clock is not None and scan_persisted_state:
-        eligible_grants = ZoomOAuthAuthorizationGrant.objects.filter(
-            project=project,
-            zoom_oauth_app=app,
-            lineage__history_complete=True,
-            lineage__has_prior_grant=False,
-            lineage__latest_grant_sequence=1,
-            grant_sequence=1,
-            legacy_history=False,
-        )
-        for grant in eligible_grants:
-            evidence = [(grant.start_clock_health_id, grant.start_clock_error_ms, grant.start_clock_continuous)]
-            if grant.generation_ended_at is not None:
-                evidence.append((grant.end_clock_health_id, grant.end_clock_error_ms, grant.end_clock_continuous))
-            for health_id, error_ms, continuous in evidence:
-                if health_id != clock.health_id or type(error_ms) is not int or continuous is not True:
-                    _fail("clock_untrusted")
-                attendee_budget = max(attendee_budget, error_ms)
-            if attendee_budget > 1000:
-                _fail("clock_untrusted")
-
+    # Historic grants without operation-coupled samples are simply never
+    # fresh-eligible (checked per binding); they are not upgraded here.
+    attendee_budget = clock.max_sample_error_ms if clock is not None else None
     return app, inert_lineage_count, inert_grant_count, attendee_budget
 
 
@@ -698,7 +680,7 @@ def collect_readiness(
     clock = None
     if require_trusted_clock:
         try:
-            clock = configured_clock_evidence()
+            clock = configured_clock_policy()
         except GrantCaptureUnavailable:
             _fail("clock_untrusted")
     _validate_schema()
@@ -712,7 +694,8 @@ def collect_readiness(
     barrier_count = 0
     inert_lineage_count = 0
     inert_grant_count = 0
-    attendee_budget = clock.error_ms if clock is not None else None
+    # The approved per-sample ceiling; each operation still samples itself.
+    attendee_budget = clock.max_sample_error_ms if clock is not None else None
     for ring in rings:
         ready_app, lineages, grants, app_budget = _validate_app_audit_state(
             ring,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,10 +15,17 @@ from bots.models import (
     Project,
     ZoomOAuthApp,
     ZoomOAuthAuthorizationGrant,
+    ZoomOAuthAuthorizationGrantClockSample,
     ZoomOAuthAuthorizationLineage,
     ZoomOAuthConnection,
     ZoomRemovalAuditKeyFingerprint,
 )
+from bots.zoom_clock_sample import (
+    ClockRejected,
+    Sample,
+    SourcePolicy,
+)
+from bots.zoom_clock_sample import sample as clock_sample
 from bots.zoom_removal_audit import (
     AUDIT_KEY_ALGORITHM,
     AUDIT_KEY_DERIVATION_DOMAIN,
@@ -34,20 +40,17 @@ class GrantCaptureUnavailable(Exception):
     pass
 
 
-@dataclass(frozen=True)
-class ClockEvidence:
-    health_id: str
-    error_ms: int
-    continuous: bool
+# v3 grants make no static v2 clock claim: the legacy columns record an
+# explicit non-claim (never continuous, error outside every budget). Their
+# only clock evidence is ZoomOAuthAuthorizationGrantClockSample.
+NO_STATIC_CLOCK_CLAIM = "no-static-clock-claim"
+NO_STATIC_CLOCK_ERROR_MS = 1001
 
 
 @dataclass(frozen=True)
 class GrantReplacementBoundary:
     at: datetime
-    clock: ClockEvidence
-
-
-_CLOCK_HEALTH_ID_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
+    clock: Sample | None
 
 
 def valid_provider_identity_component(value) -> bool:
@@ -69,25 +72,74 @@ def database_clock_now():
         return cursor.fetchone()[0]
 
 
-def configured_clock_evidence() -> ClockEvidence:
-    health_id = settings.ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID
-    error_ms = settings.ZOOM_DEAUTH_DB_CLOCK_ERROR_MS
-    continuous = settings.ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS
-    try:
-        encoded_health_id = health_id.encode("utf-8") if type(health_id) is str else b""
-    except UnicodeEncodeError:
-        raise GrantCaptureUnavailable("clock_evidence_invalid") from None
-    if (
-        not encoded_health_id
-        or len(encoded_health_id) > 64
-        or not _CLOCK_HEALTH_ID_RE.fullmatch(health_id)
-        or type(error_ms) is not int
-        or error_ms < 0
-        or error_ms > 1000
-        or continuous is not True
-    ):
+def configured_clock_policy() -> SourcePolicy:
+    """The approved per-sample source policy; a static declaration is not proof."""
+    policy = SourcePolicy.from_settings()
+    if policy is None:
         raise GrantCaptureUnavailable("clock_evidence_invalid")
-    return ClockEvidence(health_id=health_id, error_ms=error_ms, continuous=continuous)
+    return policy
+
+
+def sample_database_clock():
+    """Sample on the current transaction's connection: (Sample, None) or (None, code)."""
+    policy = SourcePolicy.from_settings()
+    if policy is None:
+        return None, "clock_source_unapproved"
+
+    def query():
+        with database_connection.cursor() as cursor:
+            cursor.execute("SELECT clock_timestamp()")
+            return cursor.fetchone()[0]
+
+    try:
+        return clock_sample(query, policy), None
+    except ClockRejected as error:
+        return None, error.args[0]
+    except Exception:
+        return None, "clock_rejected"
+
+
+def sampled_boundary() -> GrantReplacementBoundary:
+    """A boundary is the sampled instant itself. A rejected sample still
+    records the boundary (unsampled) but leaves the grant ineligible for any
+    fresh binding; it is never upgraded later."""
+    measured, _code = sample_database_clock()
+    return GrantReplacementBoundary(at=measured.db_at if measured else database_clock_now(), clock=measured)
+
+
+def _record_clock_sample(grant, boundary: str, measured: Sample | None) -> None:
+    if measured is None:
+        return
+    ZoomOAuthAuthorizationGrantClockSample.objects.create(
+        authorization_grant=grant,
+        boundary=boundary,
+        measurement_policy=measured.measurement_policy,
+        source_policy_id=measured.source_policy_id,
+        sampled_at=measured.db_at,
+        error_ms=measured.error_ms,
+        rtt_us=measured.rtt_us,
+    )
+
+
+def _end_grant(previous, replacement: GrantReplacementBoundary) -> None:
+    if previous.generation_started_at >= replacement.at:
+        raise GrantCaptureUnavailable("grant_boundary_invalid")
+    previous.generation_ended_at = replacement.at
+    previous.end_clock_health_id = NO_STATIC_CLOCK_CLAIM
+    previous.end_clock_error_ms = NO_STATIC_CLOCK_ERROR_MS
+    previous.end_clock_continuous = False
+    previous.live_connection = None
+    previous.save(
+        update_fields=[
+            "generation_ended_at",
+            "end_clock_health_id",
+            "end_clock_error_ms",
+            "end_clock_continuous",
+            "live_connection",
+            "updated_at",
+        ]
+    )
+    _record_clock_sample(previous, "end", replacement.clock)
 
 
 def provider_identity_digest(project: Project, zoom_app: ZoomOAuthApp, user_id: str, account_id: str) -> str:
@@ -257,8 +309,7 @@ def close_authorization_grant_for_replacement(
 
     if not transaction.get_connection().in_atomic_block:
         raise RuntimeError("grant replacement requires the OAuth transaction")
-    clock = configured_clock_evidence()
-    boundary = database_clock_now()
+    replacement = sampled_boundary()
     open_grants = list(
         ZoomOAuthAuthorizationGrant.objects.select_for_update().filter(
             live_connection=connection,
@@ -268,24 +319,8 @@ def close_authorization_grant_for_replacement(
     if len(open_grants) > 1:
         raise GrantCaptureUnavailable("grant_lineage_ambiguous")
     for previous in open_grants:
-        if previous.generation_started_at >= boundary:
-            raise GrantCaptureUnavailable("grant_boundary_invalid")
-        previous.generation_ended_at = boundary
-        previous.end_clock_health_id = clock.health_id
-        previous.end_clock_error_ms = clock.error_ms
-        previous.end_clock_continuous = clock.continuous
-        previous.live_connection = None
-        previous.save(
-            update_fields=[
-                "generation_ended_at",
-                "end_clock_health_id",
-                "end_clock_error_ms",
-                "end_clock_continuous",
-                "live_connection",
-                "updated_at",
-            ]
-        )
-    return GrantReplacementBoundary(at=boundary, clock=clock)
+        _end_grant(previous, replacement)
+    return replacement
 
 
 def capture_authorization_grant(
@@ -322,11 +357,8 @@ def capture_authorization_grant(
     )
     current_identity_digest = dict(candidates)[ring.current_kid]
     if replacement_boundary is None:
-        boundary = database_clock_now()
-        clock = configured_clock_evidence()
-    else:
-        boundary = replacement_boundary.at
-        clock = replacement_boundary.clock
+        replacement_boundary = sampled_boundary()
+    boundary = replacement_boundary.at
 
     _connection_ring, connection_candidates = connection_binding_candidates(connection)
     connection_candidate_by_digest = {
@@ -412,23 +444,7 @@ def capture_authorization_grant(
 
     prior_grants = {grant.pk: grant for grant in [*connection_open_grants, *open_grants]}
     for previous in prior_grants.values():
-        if previous.generation_started_at >= boundary:
-            raise GrantCaptureUnavailable("grant_boundary_invalid")
-        previous.generation_ended_at = boundary
-        previous.end_clock_health_id = clock.health_id
-        previous.end_clock_error_ms = clock.error_ms
-        previous.end_clock_continuous = clock.continuous
-        previous.live_connection = None
-        previous.save(
-            update_fields=[
-                "generation_ended_at",
-                "end_clock_health_id",
-                "end_clock_error_ms",
-                "end_clock_continuous",
-                "live_connection",
-                "updated_at",
-            ]
-        )
+        _end_grant(previous, replacement_boundary)
 
     next_sequence = lineage.latest_grant_sequence + 1
     if next_sequence > 1:
@@ -436,7 +452,7 @@ def capture_authorization_grant(
     lineage.latest_grant_sequence = next_sequence
     lineage.save(update_fields=["latest_grant_sequence", "has_prior_grant", "updated_at"])
 
-    return ZoomOAuthAuthorizationGrant.objects.create(
+    grant = ZoomOAuthAuthorizationGrant.objects.create(
         project=project,
         zoom_oauth_app=zoom_app,
         lineage=lineage,
@@ -450,8 +466,10 @@ def capture_authorization_grant(
         identity_audit_key_fingerprint=lineage.identity_audit_key_fingerprint,
         authorization_generation=connection.authorization_generation,
         generation_started_at=boundary,
-        start_clock_health_id=clock.health_id,
-        start_clock_error_ms=clock.error_ms,
-        start_clock_continuous=clock.continuous,
+        start_clock_health_id=NO_STATIC_CLOCK_CLAIM,
+        start_clock_error_ms=NO_STATIC_CLOCK_ERROR_MS,
+        start_clock_continuous=False,
         legacy_history=not lineage.history_complete,
     )
+    _record_clock_sample(grant, "start", replacement_boundary.clock)
+    return grant

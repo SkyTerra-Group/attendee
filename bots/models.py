@@ -596,6 +596,41 @@ class ZoomOAuthAuthorizationGrant(models.Model):
         ]
 
 
+
+class ZoomOAuthAuthorizationGrantClockSample(models.Model):
+    """One operation-coupled, UTC-bounded sample of a grant boundary.
+
+    A measurement of one database instant, never a continuous/step-free claim.
+    Never updated (it is deleted only with its grant); the database requires
+    sampled_at to equal the grant boundary.
+    """
+
+    class Boundaries(models.TextChoices):
+        START = "start", "Start"
+        END = "end", "End"
+
+    authorization_grant = models.ForeignKey(
+        ZoomOAuthAuthorizationGrant,
+        on_delete=models.CASCADE,
+        related_name="clock_samples",
+    )
+    boundary = models.CharField(max_length=8, choices=Boundaries.choices)
+    measurement_policy = models.CharField(max_length=64)
+    source_policy_id = models.CharField(max_length=64)
+    sampled_at = models.DateTimeField()
+    error_ms = models.PositiveIntegerField()
+    rtt_us = models.PositiveIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["authorization_grant", "boundary"], name="unique_zoom_grant_clock_sample"),
+            models.CheckConstraint(
+                condition=models.Q(boundary__in=["start", "end"], measurement_policy="operation-sampled-utc-bound-v1", error_ms__lte=1000),
+                name="zoom_grant_clock_sample_policy",
+            ),
+        ]
+
 class ZoomRemovalAuditKeyFingerprint(models.Model):
     """Permanent non-secret registry preventing audit-key ID material reuse."""
 

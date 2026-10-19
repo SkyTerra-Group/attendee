@@ -43,6 +43,7 @@ from bots.models import (
     ZoomMeetingToZoomOAuthConnectionMapping,
     ZoomOAuthApp,
     ZoomOAuthAuthorizationGrant,
+    ZoomOAuthAuthorizationGrantClockSample,
     ZoomOAuthAuthorizationLineage,
     ZoomOAuthConnection,
     ZoomRemovalAuditKeyFingerprint,
@@ -72,18 +73,21 @@ from bots.zoom_deauthorization_assertion import (
     EXISTING_ONLY,
     RESOLVE_PURPOSE,
     SETTLE_PURPOSE,
+    CLOCK_MEASUREMENT_POLICY,
     TEMPORAL_POLICY,
+    TEMPORAL_POLICY_V2,
     AssertionRejected,
     verify_deauthorization_assertion,
 )
 from bots.zoom_deauthorization_grants import (
     GrantCaptureUnavailable,
-    configured_clock_evidence,
+    configured_clock_policy,
     connection_binding_digest,
     database_clock_now,
     expected_client_id_digest,
     provider_identity_digest,
 )
+from bots.zoom_clock_sample import Kernel, LocalProbe, Sample
 from bots.zoom_deauthorization_readiness import DeauthorizationReadinessError, collect_readiness
 from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
 from bots.zoom_removal_audit import (
@@ -288,13 +292,50 @@ class ZoomDeauthorizationVectorTests(SimpleTestCase):
             }
         }
         with override_settings(ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON=registry):
-            verified = verify_deauthorization_assertion(
-                generated,
-                project=SimpleNamespace(object_id=claims["project_id"]),
-                purpose=SETTLE_PURPOSE,
-                received_at=datetime.fromtimestamp(claims["iat"], tz=datetime_timezone.utc),
+            # The retained v2 vector stays byte-exact, but its static
+            # continuous/step_free declaration can no longer create a binding.
+            with self.assertRaises(AssertionRejected) as raised:
+                verify_deauthorization_assertion(
+                    generated,
+                    project=SimpleNamespace(object_id=claims["project_id"]),
+                    purpose=SETTLE_PURPOSE,
+                    received_at=datetime.fromtimestamp(claims["iat"], tz=datetime_timezone.utc),
+                )
+            self.assertEqual(raised.exception.code, "clock_untrusted")
+            v3 = fixture["v3"]
+            v3_claims = v3["settlement_claims"]
+            generated_v3 = sign_claims(
+                v3_claims,
+                private_key=Ed25519PrivateKey.from_private_bytes(seed),
+                header=fixture["header"],
             )
-        self.assertEqual(verified.claims, claims)
+            self.assertEqual(generated_v3, v3["compact_jws"])
+            self.assertEqual(hashlib.sha256(generated_v3.encode("ascii")).hexdigest(), v3["compact_jws_sha256"])
+            verified = verify_deauthorization_assertion(
+                generated_v3,
+                project=SimpleNamespace(object_id=v3_claims["project_id"]),
+                purpose=SETTLE_PURPOSE,
+                received_at=datetime.fromtimestamp(v3_claims["iat"], tz=datetime_timezone.utc),
+            )
+        self.assertEqual(verified.claims, v3_claims)
+        self.assertEqual(v3_claims["temporal_policy"], TEMPORAL_POLICY)
+        self.assertFalse({"client_clock_continuous", "client_clock_step_free"} & set(v3_claims))
+
+    def test_public_v3_temporal_evidence_vector_is_byte_exact(self):
+        vector = json.loads(
+            (Path(__file__).with_name("fixtures") / "zoom_deauthorization_vectors.json").read_text()
+        )["v3"]["temporal_evidence_vector"]
+        snapshot = vector["snapshot"]
+        self.assertEqual(
+            json.dumps([snapshot[name] for name in vector["ordered_fields"]], separators=(",", ":"), ensure_ascii=False),
+            vector["canonical_candidate_json"],
+        )
+        candidate_digest = candidate_temporal_evidence_digest(snapshot)
+        self.assertEqual(candidate_digest, vector["candidate_evidence_digest"])
+        self.assertEqual(
+            binding_temporal_evidence_digest(candidate_digest, vector["event_binding_id"], vector["event_binding_version"]),
+            vector["binding_evidence_digest"],
+        )
 
     def test_public_temporal_evidence_vector_is_byte_exact(self):
         fixture = json.loads(
@@ -364,12 +405,27 @@ class ZoomDeauthorizationVectorTests(SimpleTestCase):
     ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID="attendee-db-clock-test-v1",
     ZOOM_DEAUTH_DB_CLOCK_ERROR_MS=0,
     ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS=True,
+    ZOOM_DEAUTH_CLOCK_SOURCE_POLICY_ID="attendee-src-test",
+    ZOOM_DEAUTH_CLOCK_MAX_SAMPLE_ERROR_MS="1000",
+    ZOOM_DEAUTH_CLOCK_MAX_RTT_MS="1000",
     LOG_BOT_STATE_CHANGES=False,
 )
 class ZoomSignedDeauthorizationTests(TransactionTestCase):
+    """The v2 static clock settings above are deliberately still set: they
+    must not admit anything. Kernel evidence is SYNTHETIC (patched healthy,
+    maxerror 0) and the binding sample is a fixed SYNTHETIC value so digests
+    are predictable; neither is evidence of live clock readiness."""
+
     reset_sequences = True
 
     def setUp(self):
+        self.kernel_patch = patch.object(LocalProbe, "kernel", return_value=Kernel(0, 0x2001, 0))
+        self.kernel_patch.start()
+        self.binding_sample_patch = patch(
+            "bots.zoom_deauthorization.sample_database_clock",
+            side_effect=lambda: (self.binding_sample, None) if self.binding_sample else (None, "clock_rejected"),
+        )
+        self.binding_sample_patch.start()
         self.organization = Organization.objects.create(name="Signed Deauthorization Tests")
         self.project = Project.objects.create(organization=self.organization, name="Project A")
         self.other_project = Project.objects.create(organization=self.organization, name="Project B")
@@ -423,6 +479,12 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.registry_override = override_settings(ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON=self.registry)
         self.registry_override.enable()
         self.now = int(database_clock_now().timestamp())
+        self.binding_sample = Sample(
+            db_at=datetime.fromtimestamp(self.now, tz=datetime_timezone.utc),
+            error_ms=0,
+            rtt_us=1,
+            source_policy_id="attendee-src-test",
+        )
         self.connection = ZoomOAuthConnection.objects.create(
             zoom_oauth_app=self.zoom_app,
             user_id="user-marker-A",
@@ -466,10 +528,25 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             start_clock_continuous=True,
             legacy_history=False,
         )
+        self.add_clock_sample(self.grant, "start")
 
     def tearDown(self):
         self.registry_override.disable()
         self.audit_ring_override.disable()
+        self.binding_sample_patch.stop()
+        self.kernel_patch.stop()
+
+    def add_clock_sample(self, grant, boundary, *, error_ms=0, source="attendee-src-test"):
+        """SYNTHETIC boundary sample row for fixture grants (never readiness)."""
+        return ZoomOAuthAuthorizationGrantClockSample.objects.create(
+            authorization_grant=grant,
+            boundary=boundary,
+            measurement_policy=CLOCK_MEASUREMENT_POLICY,
+            source_policy_id=source,
+            sampled_at=grant.generation_started_at if boundary == "start" else grant.generation_ended_at,
+            error_ms=error_ms,
+            rtt_us=1,
+        )
 
     def activate_audit_registry(self):
         if self.audit_ring_override is not None:
@@ -573,7 +650,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         registry, audience = self.add_registry_app(app)
         return app, connection, lineage, grant, registry, audience
 
-    def replace_grant_fixture(self, *, lineage_overrides=None, **grant_overrides):
+    def replace_grant_fixture(self, *, lineage_overrides=None, start_sample_error_ms=0, **grant_overrides):
         """Build a different immutable history fixture instead of rewriting it."""
 
         grant_values = {
@@ -624,6 +701,10 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         grant_values["lineage"] = self.lineage
         grant_values.update(grant_overrides)
         self.grant = ZoomOAuthAuthorizationGrant.objects.create(**grant_values)
+        if start_sample_error_ms is not None:
+            self.add_clock_sample(self.grant, "start", error_ms=start_sample_error_ms)
+        if self.grant.generation_ended_at is not None:
+            self.add_clock_sample(self.grant, "end", error_ms=start_sample_error_ms or 0)
         return self.grant
 
     def common_claims(self, *, purpose, mode=CREATE_IF_FRESH, event_id=None, event_at=None, request_at=None, first_at=None, iat=None):
@@ -646,10 +727,10 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             "zoom_event_precision_ms": 1000,
             "zoom_request_precision_ms": 1000,
             "temporal_policy": TEMPORAL_POLICY,
-            "client_clock_health_id": "client-db-clock-test-v1",
-            "client_clock_continuous": True,
-            "client_clock_step_free": True,
-            "client_clock_error_ms": 0,
+            "clock_measurement_policy": CLOCK_MEASUREMENT_POLICY,
+            "client_clock_source_policy_id": "client-src-test",
+            "client_receipt_clock_error_ms": 0,
+            "client_issuance_clock_error_ms": 0,
             "iat": iat,
             "nbf": iat - 1,
             "exp": iat + 120,
@@ -667,13 +748,13 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 "connection_generation": str(self.grant.authorization_generation),
             }
         )
+        samples = {sample.boundary: sample for sample in self.grant.clock_samples.all()}
         snapshot = _candidate_snapshot(
-            SimpleNamespace(
-                claims=claims,
-                received_at=datetime.fromtimestamp(claims["iat"], tz=datetime_timezone.utc),
-            ),
+            SimpleNamespace(claims=claims),
             self.grant,
-            configured_clock_evidence(),
+            samples.get("start"),
+            samples.get("end"),
+            self.binding_sample,
         )
         claims["temporal_evidence_digest"] = candidate_temporal_evidence_digest(snapshot)
         return claims
@@ -835,40 +916,44 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(ZoomDeauthorizationEventBinding.objects.count(), 1)
         self.assertEqual(ZoomRemovalOperation.objects.count(), 1)
 
-    @override_settings(ZOOM_DEAUTH_DB_CLOCK_ERROR_MS=700)
-    def test_receipt_clock_max_error_is_frozen_and_retry_uses_exact_snapshot(self):
+    def test_sampled_bounds_are_frozen_and_retry_uses_exact_snapshot(self):
+        self.binding_sample = Sample(
+            db_at=self.binding_sample.db_at, error_ms=700, rtt_us=1, source_policy_id="attendee-src-test"
+        )
         claims = self.settle_claims()
-        claims["client_clock_error_ms"] = 300
+        claims["client_receipt_clock_error_ms"] = 300
+        claims["client_issuance_clock_error_ms"] = 200
+        samples = {sample.boundary: sample for sample in self.grant.clock_samples.all()}
+        snapshot = _candidate_snapshot(SimpleNamespace(claims=claims), self.grant, samples["start"], None, self.binding_sample)
+        claims["temporal_evidence_digest"] = candidate_temporal_evidence_digest(snapshot)
         first = self.post_assertion("/api/v1/zoom_retention/deauthorization", claims)
         self.assertEqual(first.status_code, 200, first.content)
         binding = ZoomDeauthorizationEventBinding.objects.get()
-        self.assertEqual(
-            binding.evidence_snapshot["attendee_receipt_clock_health_id"],
-            "attendee-db-clock-test-v1",
-        )
-        self.assertEqual(binding.evidence_snapshot["attendee_receipt_clock_error_ms"], 700)
-        self.assertIs(binding.evidence_snapshot["attendee_receipt_clock_continuous"], True)
-        self.assertEqual(binding.evidence_snapshot["client_clock_error_ms"], 300)
+        self.assertEqual(binding.temporal_policy, TEMPORAL_POLICY)
+        frozen = binding.evidence_snapshot
+        self.assertEqual(frozen["clock_measurement_policy"], CLOCK_MEASUREMENT_POLICY)
+        self.assertEqual(frozen["attendee_binding_clock_error_ms"], 700)
+        self.assertEqual(frozen["attendee_boundary_clock_error_ms"], [0, None])
+        self.assertEqual(frozen["client_receipt_clock_error_ms"], 300)
+        self.assertEqual(frozen["attendee_binding_received_at"], "%s" % self.binding_sample.db_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        self.assertFalse({"client_clock_continuous", "client_clock_step_free", "attendee_receipt_clock_continuous"} & set(frozen))
 
+        # Retry after the source policy disappears and the sampler fails:
+        # existing_only recovers the exact frozen binding, never re-samples it.
+        self.binding_sample = None
         claims.update(
             {
                 "binding_mode": EXISTING_ONLY,
                 "jti": str(uuid.uuid4()),
+                "client_issuance_clock_error_ms": None,
                 "temporal_evidence_digest": binding.binding_evidence_digest,
             }
         )
-        with override_settings(
-            ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID="changed-untrusted-clock",
-            ZOOM_DEAUTH_DB_CLOCK_ERROR_MS=1001,
-            ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS=False,
-        ):
-            replay = self.post_assertion(
-                "/api/v1/zoom_retention/deauthorization",
-                claims,
-            )
+        with override_settings(ZOOM_DEAUTH_CLOCK_SOURCE_POLICY_ID=""):
+            replay = self.post_assertion("/api/v1/zoom_retention/deauthorization", claims)
         self.assertEqual(replay.status_code, 200, replay.content)
         binding.refresh_from_db()
-        self.assertEqual(binding.evidence_snapshot["attendee_receipt_clock_error_ms"], 700)
+        self.assertEqual(binding.evidence_snapshot, frozen)
 
     def test_existing_only_resolver_miss_is_target_free_and_never_matches(self):
         claims = self.resolve_claims(mode=EXISTING_ONLY)
@@ -993,9 +1078,10 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
 
     def test_clock_and_precision_claims_fail_closed(self):
         cases = [
-            ("client_clock_continuous", False, "clock_untrusted"),
-            ("client_clock_step_free", False, "clock_untrusted"),
-            ("client_clock_error_ms", 1001, "clock_error_invalid"),
+            ("clock_measurement_policy", "continuous-step-free", "clock_untrusted"),
+            ("client_receipt_clock_error_ms", 1001, "clock_error_invalid"),
+            ("client_issuance_clock_error_ms", None, "clock_error_invalid"),
+            ("client_clock_source_policy_id", None, "clock_source_invalid"),
             ("zoom_event_precision_ms", 1001, "event_precision_invalid"),
         ]
         for field, value, code in cases:
@@ -1029,13 +1115,76 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertFalse(ZoomDeauthorizationTargetResolution.objects.exists())
         self.assertFalse(ZoomDeauthorizationAssertionReceipt.objects.exists())
 
-    def test_combined_clock_error_over_one_second_is_durable_clock_untrusted(self):
-        self.replace_grant_fixture(start_clock_error_ms=1)
+    def _budget_case(self, receipt_error, issuance_error, start_error, binding_error):
+        self.replace_grant_fixture(start_sample_error_ms=start_error)
+        self.binding_sample = Sample(
+            db_at=self.binding_sample.db_at, error_ms=binding_error, rtt_us=1, source_policy_id="attendee-src-test"
+        )
         claims = self.resolve_claims()
-        claims["client_clock_error_ms"] = 1000
+        claims["client_receipt_clock_error_ms"] = receipt_error
+        claims["client_issuance_clock_error_ms"] = issuance_error
         response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", claims)
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["outcome"], ZoomDeauthorizationResolutionOutcomes.CLOCK_UNTRUSTED)
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()["outcome"]
+
+    def test_combined_sampled_budget_boundary(self):
+        # max(client receipt, issuance) + max(grant start, grant end, binding) <= 1000
+        for case in ((601, 0, 400, 0), (0, 601, 0, 400), (300, 300, 701, 0), (300, 300, 0, 701)):
+            with self.subTest(case=case):
+                self.assertEqual(self._budget_case(*case), ZoomDeauthorizationResolutionOutcomes.CLOCK_UNTRUSTED)
+        self.assertFalse(ZoomDeauthorizationEventBinding.objects.exists())
+        self.assertEqual(self._budget_case(600, 0, 400, 0), ZoomDeauthorizationResolutionOutcomes.RESOLVED)
+
+    def test_combined_budget_issuance_and_binding_dominant_exact_boundary(self):
+        self.assertEqual(self._budget_case(0, 600, 0, 400), ZoomDeauthorizationResolutionOutcomes.RESOLVED)
+
+    def test_historic_or_mismatched_grant_samples_are_never_upgraded(self):
+        variants = ("missing", "other_source", "binding_sampler_rejects", "ended_without_end_sample")
+        healthy = self.binding_sample
+        for variant in variants:
+            with self.subTest(variant=variant):
+                ZoomDeauthorizationTargetResolution.objects.all().delete()
+                self.binding_sample = healthy
+                if variant == "missing":
+                    # A pre-v3 grant: static v2 columns claim continuity, no sample.
+                    self.replace_grant_fixture(start_sample_error_ms=None)
+                elif variant == "other_source":
+                    self.replace_grant_fixture(start_sample_error_ms=None)
+                    self.add_clock_sample(self.grant, "start", source="other-source")
+                elif variant == "ended_without_end_sample":
+                    # Ended under a static v2 declaration: no end sample exists.
+                    self.replace_grant_fixture()
+                    ZoomOAuthAuthorizationGrant.objects.filter(pk=self.grant.pk).update(
+                        live_connection=None,
+                        generation_ended_at=datetime.fromtimestamp(self.now + 120, tz=datetime_timezone.utc),
+                        end_clock_health_id="attendee-db-clock-test-v1",
+                        end_clock_error_ms=0,
+                        end_clock_continuous=True,
+                    )
+                    self.connection.delete()
+                else:
+                    self.replace_grant_fixture()
+                    self.binding_sample = None
+                response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", self.resolve_claims())
+                self.assertEqual(response.status_code, 200, response.content)
+                self.assertEqual(response.json()["outcome"], ZoomDeauthorizationResolutionOutcomes.CLOCK_UNTRUSTED)
+                self.assertFalse(ZoomDeauthorizationEventBinding.objects.exists())
+
+    def test_v2_static_claims_never_create_but_v2_shape_is_recognised(self):
+        claims = self.resolve_claims()
+        for name in ("clock_measurement_policy", "client_clock_source_policy_id",
+                     "client_receipt_clock_error_ms", "client_issuance_clock_error_ms"):
+            claims.pop(name)
+        claims.update(temporal_policy=TEMPORAL_POLICY_V2, client_clock_health_id="client-db-clock-test-v1",
+                      client_clock_continuous=True, client_clock_step_free=True, client_clock_error_ms=0)
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", claims)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["error"], "clock_untrusted")
+        claims.update(binding_mode=EXISTING_ONLY, jti=str(uuid.uuid4()))
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", claims)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["outcome"], ZoomDeauthorizationResolutionOutcomes.DELAYED_EVENT_UNBOUND)
+        self.assertFalse(ZoomDeauthorizationEventBinding.objects.exists())
 
     def test_wrong_signature_project_audience_app_and_unknown_claim_change_nothing(self):
         cases = []
@@ -1365,6 +1514,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             start_clock_error_ms=0,
             start_clock_continuous=True,
         )
+        self.add_clock_sample(self.grant, "start")
         connection_id = self.connection.object_id
         direct = self.post_assertion(
             "/api/v1/zoom_retention/deauthorization",
@@ -2151,6 +2301,94 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         serialized = ZoomOAuthConnectionSerializer(second).data
         self.assertEqual(serialized["zoom_oauth_app_binding"], str(self.app_binding))
         self.assertEqual(serialized["grant_sequence"], 2)
+        # Each boundary is the operation-coupled sampled instant itself; the
+        # legacy v2 columns carry an explicit non-claim, never continuity.
+        first_samples = {sample.boundary: sample for sample in grants[0].clock_samples.all()}
+        second_samples = {sample.boundary: sample for sample in grants[1].clock_samples.all()}
+        self.assertEqual(set(first_samples), {"start", "end"})
+        self.assertEqual(set(second_samples), {"start"})
+        self.assertEqual(first_samples["start"].sampled_at, grants[0].generation_started_at)
+        self.assertEqual(first_samples["end"].sampled_at, grants[0].generation_ended_at)
+        self.assertEqual(second_samples["start"].sampled_at, grants[1].generation_started_at)
+        for sample in [*first_samples.values(), *second_samples.values()]:
+            self.assertEqual(sample.measurement_policy, CLOCK_MEASUREMENT_POLICY)
+            self.assertEqual(sample.source_policy_id, "attendee-src-test")
+            self.assertLessEqual(sample.error_ms, 1000)
+        for grant in grants:
+            self.assertFalse(grant.start_clock_continuous)
+            self.assertEqual(grant.start_clock_error_ms, 1001)
+        self.assertIs(grants[0].end_clock_continuous, False)
+
+    def test_rejected_boundary_sample_records_grant_without_fresh_evidence(self):
+        ZoomOAuthAuthorizationGrant.objects.all().delete()
+        ZoomOAuthConnection.objects.all().delete()
+        payload = {
+            "zoom_oauth_app_binding": str(self.app_binding),
+            "authorization_code": "code-marker",
+            "redirect_uri": "https://client-agent.test/callback",
+        }
+        token = {
+            "access_token": "access-marker",
+            "refresh_token": "refresh-marker",
+            "scope": "user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token",
+        }
+        user = {"id": "stable-user", "account_id": "stable-account", "status": "active"}
+        # SYNTHETIC unsynchronized kernel (STA_UNSYNC) at the boundary.
+        with patch.object(LocalProbe, "kernel", return_value=Kernel(0, 0x0041, 0)), patch(
+            "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens", return_value=token
+        ), patch("bots.zoom_oauth_connections_api_utils._get_user_info", return_value=user):
+            connection, error = create_zoom_oauth_connection(payload, self.project)
+        self.assertIsNone(error)
+        grant = connection.authorization_grant
+        self.assertFalse(grant.clock_samples.exists())
+        self.connection, self.grant = connection, grant
+        claims = self.resolve_claims(iat=self.now + 120, event_at=self.now + 120, request_at=self.now + 120, first_at=self.now + 120)
+        self.binding_sample = Sample(
+            db_at=datetime.fromtimestamp(self.now + 120, tz=datetime_timezone.utc), error_ms=0, rtt_us=1,
+            source_policy_id="attendee-src-test",
+        )
+        with patch("bots.zoom_retention_api_views.database_clock_now",
+                   return_value=datetime.fromtimestamp(self.now + 120, tz=datetime_timezone.utc)):
+            response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", claims)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["outcome"], ZoomDeauthorizationResolutionOutcomes.CLOCK_UNTRUSTED)
+        self.assertFalse(ZoomDeauthorizationEventBinding.objects.exists())
+
+    def test_clock_sample_rows_are_boundary_coupled_and_never_updated(self):
+        sample = self.grant.clock_samples.get()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ZoomOAuthAuthorizationGrantClockSample.objects.filter(pk=sample.pk).update(error_ms=1)
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ZoomOAuthAuthorizationGrantClockSample.objects.create(
+                authorization_grant=self.grant, boundary="end", measurement_policy=CLOCK_MEASUREMENT_POLICY,
+                source_policy_id="attendee-src-test", sampled_at=self.grant.generation_started_at, error_ms=0, rtt_us=1,
+            )
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            ZoomOAuthAuthorizationGrantClockSample.objects.create(
+                authorization_grant=self.grant, boundary="start", measurement_policy="continuous-step-free",
+                source_policy_id="attendee-src-test", sampled_at=self.grant.generation_started_at, error_ms=0, rtt_us=1,
+            )
+        sample.refresh_from_db()
+        self.assertEqual(sample.error_ms, 0)
+
+    def test_real_kernel_sample_mechanics_are_not_readiness(self):
+        """Real adjtimex(modes=0) and real PostgreSQL on this host: mechanics
+        only, under an unapproved test policy; never live readiness."""
+        from bots.zoom_deauthorization_grants import sample_database_clock
+
+        self.kernel_patch.stop()
+        try:
+            real_kernel = LocalProbe().kernel()
+            with transaction.atomic():
+                measured, code = sample_database_clock()
+        finally:
+            self.kernel_patch.start()
+        if measured is None:
+            self.assertIn(code, {"clock_unsynchronized", "clock_local_movement", "clock_bound_excessive",
+                                 "clock_bracket_violation", "clock_latency_excessive"})
+        else:
+            self.assertGreaterEqual(measured.error_ms, -(-real_kernel.maxerror_us // 1000))
+            self.assertEqual(measured.source_policy_id, "attendee-src-test")
 
     def test_rotation_reads_retained_identity_key_and_writes_current_connection_key(self):
         new_kid = "zar-test-current-v2"
@@ -2622,9 +2860,9 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                     collect_readiness(project=self.project, app=self.zoom_app)
                 self.assertEqual(raised.exception.code, "signer_registry_invalid")
 
-        with override_settings(ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID="unpaired-\ud800"):
+        with override_settings(ZOOM_DEAUTH_CLOCK_SOURCE_POLICY_ID="unpaired-\ud800"):
             with self.assertRaises(GrantCaptureUnavailable) as raised:
-                configured_clock_evidence()
+                configured_clock_policy()
         self.assertEqual(str(raised.exception), "clock_evidence_invalid")
 
     def test_exact_app_oauth_capture_fails_closed_without_audit_key(self):
