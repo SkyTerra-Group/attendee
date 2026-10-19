@@ -16,7 +16,8 @@ from bots.models import (
 from bots.tasks.sync_zoom_oauth_connection_task import (
     sync_zoom_oauth_connection,
 )
-from bots.zoom_oauth_connections_utils import ZoomAPIAuthenticationError
+from bots.tests.zoom_log_capture import CaptureZoomLogBytes
+from bots.zoom_oauth_connections_utils import ZoomAPIAuthenticationError, ZoomAPIError
 
 
 class TestSyncZoomOAuthConnection(TestCase):
@@ -108,14 +109,29 @@ class TestSyncZoomOAuthConnection(TestCase):
         """Test sync handles general exceptions properly."""
         mock_get_access_token.side_effect = Exception("Network error")
 
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(ZoomAPIError) as cm:
             sync_zoom_oauth_connection(self.zoom_oauth_connection.id)
 
-        self.assertIn("Network error", str(cm.exception))
+        self.assertEqual(str(cm.exception), "zoom_oauth_sync_failed")
 
         # Verify last_attempted_sync_at is updated even on error
         self.zoom_oauth_connection.refresh_from_db()
         self.assertIsNotNone(self.zoom_oauth_connection.last_attempted_sync_at)
+
+    @patch("bots.tasks.sync_zoom_oauth_connection_task.ZoomOAuthConnection.objects.get")
+    def test_initial_database_failure_raises_fixed_error_without_unbound_local(
+        self,
+        mock_get,
+    ):
+        provider_marker = "database-provider-body-canary"
+        mock_get.side_effect = RuntimeError(provider_marker)
+
+        with CaptureZoomLogBytes() as capture:
+            with self.assertRaises(ZoomAPIError) as raised:
+                sync_zoom_oauth_connection(self.zoom_oauth_connection.id)
+
+        self.assertEqual(str(raised.exception), "zoom_oauth_sync_failed")
+        capture.assert_absent(self, provider_marker)
 
     @patch("bots.tasks.sync_zoom_oauth_connection_task._upsert_zoom_meeting_to_zoom_oauth_connection_mapping")
     @patch("bots.tasks.sync_zoom_oauth_connection_task._get_zoom_personal_meeting_id")
@@ -289,7 +305,7 @@ class TestGetAccessToken(TestCase):
         with self.assertRaises(ZoomAPIAuthenticationError) as cm:
             _get_access_token(connection)
 
-        self.assertIn("No credentials found", str(cm.exception))
+        self.assertEqual(str(cm.exception), "zoom_credentials_unavailable")
 
     def test_get_access_token_missing_refresh_token(self):
         """Test access token retrieval when refresh token is missing."""
@@ -300,7 +316,7 @@ class TestGetAccessToken(TestCase):
         with self.assertRaises(ZoomAPIAuthenticationError) as cm:
             _get_access_token(self.zoom_oauth_connection)
 
-        self.assertIn("Missing refresh_token", str(cm.exception))
+        self.assertEqual(str(cm.exception), "zoom_credentials_incomplete")
 
     @patch("requests.post")
     def test_get_access_token_no_access_token_in_response(self, mock_post):
@@ -315,7 +331,7 @@ class TestGetAccessToken(TestCase):
         with self.assertRaises(ZoomAPIError) as cm:
             _get_access_token(self.zoom_oauth_connection)
 
-        self.assertIn("No access_token in refresh response", str(cm.exception))
+        self.assertEqual(str(cm.exception), "zoom_refresh_access_token_missing")
 
 
 class TestUpsertZoomMeetingMapping(TestCase):

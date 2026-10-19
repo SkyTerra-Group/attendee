@@ -107,7 +107,11 @@ class ZoomWebBotAdapter(WebBotAdapter, ZoomWebUIMethods):
         return result
 
     def send_video(self, video_url, loop=False, mute_video=False):
-        logger.info(f"send_video called with video_url = {video_url}, loop = {loop}, mute_video = {mute_video}")
+        logger.info(
+            "zoom_web_send_video_started loop=%s mute_video=%s",
+            loop,
+            mute_video,
+        )
         self.driver.execute_script(f"window.botOutputManager.playVideo({json.dumps(video_url)}, {json.dumps(loop)}, {json.dumps(mute_video)})")
 
     def change_gallery_view_page(self, next_page: bool):
@@ -126,7 +130,10 @@ class ZoomWebBotAdapter(WebBotAdapter, ZoomWebUIMethods):
             index=self.authorized_user_not_in_meeting_retries,
         )
         if onbehalf_token:
-            logger.info(f"Using onbehalf token {(onbehalf_token or '')[:6]}...{(onbehalf_token or '')[-6:]} for retry {self.authorized_user_not_in_meeting_retries}")
+            logger.info(
+                "zoom_web_onbehalf_token_selected retry_count=%s",
+                self.authorized_user_not_in_meeting_retries,
+            )
 
         return f"""
             window.zoomInitialData = {{

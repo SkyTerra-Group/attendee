@@ -11,6 +11,7 @@ from django.utils import timezone as django_timezone
 from accounts.models import Organization
 from bots.management.commands.run_scheduler import CALENDAR_SYNC_THRESHOLD_HOURS, Command
 from bots.models import Bot, BotStates, Calendar, CalendarPlatform, CalendarStates, Project, ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
+from bots.tests.zoom_log_capture import CaptureZoomLogBytes
 
 
 def _build_celery_unacked_entry(bot_id, join_at_iso):
@@ -100,6 +101,32 @@ class RunSchedulerCommandTestCase(TestCase):
             with patch("builtins.open") as mock_open:
                 command._write_heartbeat()
                 mock_open.assert_not_called()
+
+    def test_scheduler_cycle_exception_uses_fixed_code_without_exception_text(self):
+        command = Command()
+        provider_marker = "scheduler-zoom-provider-body-canary"
+
+        def fail_cycle():
+            command._keep_running = False
+            raise RuntimeError(provider_marker)
+
+        with CaptureZoomLogBytes() as capture, patch(
+            "bots.management.commands.run_scheduler.signal.signal"
+        ), patch(
+            "bots.management.commands.run_scheduler.InstanceHealthSnapshotTaker"
+        ), patch(
+            "bots.management.commands.run_scheduler.InstanceHealthAlertManager"
+        ), patch(
+            "bots.management.commands.run_scheduler.connection.close"
+        ), patch.object(
+            command,
+            "_run_scheduled_bots",
+            side_effect=fail_cycle,
+        ):
+            command.handle(interval=0)
+
+        capture.assert_absent(self, provider_marker)
+        self.assertIn(b"scheduler_cycle_failed code=internal_error", capture.bytes)
 
     def test_run_scheduled_bots_ignores_bots_outside_time_threshold(self):
         """Test that bots outside the 5-minute time window are ignored"""

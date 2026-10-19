@@ -156,7 +156,10 @@ class TestSyncBotWithCalendarEvent(TestCase):
             sync_bot_with_calendar_event(self.bot, self.calendar_event)
 
         mock_delete_bot.assert_called_once_with(self.bot)
-        self.assertIn("Failed to delete bot", log.output[0])
+        self.assertIn(
+            "calendar_sync_bot_delete_failed code=delete_rejected",
+            log.output[0],
+        )
 
     @patch("bots.tasks.sync_calendar_task.patch_bot")
     def test_sync_bot_updates_meeting_url_and_join_at(self, mock_patch_bot):
@@ -209,7 +212,10 @@ class TestSyncBotWithCalendarEvent(TestCase):
             sync_bot_with_calendar_event(self.bot, self.calendar_event)
 
         mock_patch_bot.assert_called_once()
-        self.assertIn("Failed to patch bot", log.output[0])
+        self.assertIn(
+            "calendar_sync_bot_patch_failed code=patch_rejected",
+            log.output[0],
+        )
 
 
 class TestSyncBotsForCalendarEvent(TestCase):

@@ -13,7 +13,8 @@ from bots.models import (
 from bots.tasks.refresh_zoom_oauth_connection_task import (
     refresh_zoom_oauth_connection,
 )
-from bots.zoom_oauth_connections_utils import ZoomAPIAuthenticationError
+from bots.tests.zoom_log_capture import CaptureZoomLogBytes
+from bots.zoom_oauth_connections_utils import ZoomAPIAuthenticationError, ZoomAPIError
 
 
 class TestRefreshZoomOAuthConnection(TestCase):
@@ -58,7 +59,10 @@ class TestRefreshZoomOAuthConnection(TestCase):
         self.zoom_oauth_connection.refresh_from_db()
         self.assertEqual(self.zoom_oauth_connection.state, ZoomOAuthConnectionStates.DISCONNECTED)
         self.assertIsNotNone(self.zoom_oauth_connection.connection_failure_data)
-        self.assertIn("Invalid credentials", self.zoom_oauth_connection.connection_failure_data["error"])
+        self.assertEqual(
+            self.zoom_oauth_connection.connection_failure_data["error"],
+            "zoom_authentication_rejected",
+        )
         self.assertIn("timestamp", self.zoom_oauth_connection.connection_failure_data)
 
     @patch("bots.tasks.refresh_zoom_oauth_connection_task._get_access_token")
@@ -66,13 +70,28 @@ class TestRefreshZoomOAuthConnection(TestCase):
         """Test refresh handles general exceptions properly."""
         mock_get_access_token.side_effect = Exception("Network error")
 
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(ZoomAPIError) as cm:
             refresh_zoom_oauth_connection(self.zoom_oauth_connection.id)
 
-        self.assertIn("Network error", str(cm.exception))
+        self.assertEqual(str(cm.exception), "zoom_oauth_refresh_failed")
 
         self.zoom_oauth_connection.refresh_from_db()
         self.assertIsNotNone(self.zoom_oauth_connection.last_attempted_token_refresh_at)
+
+    @patch("bots.tasks.refresh_zoom_oauth_connection_task.ZoomOAuthConnection.objects.get")
+    def test_initial_database_failure_raises_fixed_error_without_unbound_local(
+        self,
+        mock_get,
+    ):
+        provider_marker = "database-provider-body-canary"
+        mock_get.side_effect = RuntimeError(provider_marker)
+
+        with CaptureZoomLogBytes() as capture:
+            with self.assertRaises(ZoomAPIError) as raised:
+                refresh_zoom_oauth_connection(self.zoom_oauth_connection.id)
+
+        self.assertEqual(str(raised.exception), "zoom_oauth_refresh_failed")
+        capture.assert_absent(self, provider_marker)
 
     @patch("bots.tasks.refresh_zoom_oauth_connection_task._get_access_token")
     def test_refresh_zoom_oauth_connection_clears_failure_data(self, mock_get_access_token):

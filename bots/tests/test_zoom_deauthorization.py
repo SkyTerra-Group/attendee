@@ -55,6 +55,10 @@ from bots.models import (
 )
 from bots.serializers import ZoomOAuthConnectionSerializer
 from bots.tasks.refresh_zoom_oauth_connection_task import refresh_zoom_oauth_connection
+from bots.tests.zoom_log_capture import (
+    CaptureConfiguredZoomLogBytes,
+    CaptureZoomLogBytes,
+)
 from bots.zoom_deauthorization import (
     DeauthorizationServiceError,
     _candidate_snapshot,
@@ -89,6 +93,7 @@ from bots.zoom_removal_audit import (
     key_fingerprint,
 )
 from bots.zoom_retention import (
+    RECEIPT_RETENTION_DAYS,
     DatabaseVerificationError,
     ProviderOutcome,
     _claim_alternate_identifier,
@@ -723,10 +728,33 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertFalse(WebhookDeliveryAttempt.objects.filter(pk=delivery.pk).exists())
         self.assertEqual(ZoomDeauthorizationEventBinding.objects.count(), 1)
         self.assertEqual(ZoomDeauthorizationAssertionReceipt.objects.count(), 1)
+        operation = ZoomRemovalOperation.objects.get()
+        receipt = ZoomDeauthorizationAssertionReceipt.objects.get()
+        binding = ZoomDeauthorizationEventBinding.objects.get()
+        self.assertIsNone(operation.target_object_id)
+        self.assertEqual(operation.storage_manifest, {})
+        self.assertIsNone(operation.lease_token)
+        self.assertIsNone(operation.lease_expires_at)
+        self.assertEqual(
+            operation.expires_at - operation.completed_at,
+            timedelta(days=RECEIPT_RETENTION_DAYS),
+        )
+        self.assertEqual(
+            receipt.expires_at - receipt.received_at,
+            timedelta(days=RECEIPT_RETENTION_DAYS),
+        )
+        durable_safe_evidence = json.dumps(
+            {
+                "operation": operation_result(operation),
+                "binding": binding.evidence_snapshot,
+            },
+            sort_keys=True,
+        )
         revoke.assert_not_called()
         rendered = response.content.decode()
         for marker in (self.connection.user_id, self.connection.account_id, self.connection.object_id, "refresh-marker-A", claims["zoom_event_id"]):
             self.assertNotIn(marker, rendered)
+            self.assertNotIn(marker, durable_safe_evidence)
 
     def test_duplicate_nonce_and_bound_create_are_non_mutating(self):
         claims = self.settle_claims()
@@ -2630,33 +2658,128 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
     def test_new_signed_path_emits_no_raw_claims_or_assertion_to_logs(self):
         claims = self.settle_claims()
         assertion = sign_claims(claims, private_key=self.private_key)
-        records = []
-
-        class Capture(logging.Handler):
-            def emit(self, record):
-                records.append(self.format(record))
-
-        handler = Capture()
-        logging.getLogger().addHandler(handler)
-        try:
+        with CaptureZoomLogBytes() as capture:
             response = self.post_assertion(
                 "/api/v1/zoom_retention/deauthorization",
                 claims,
                 assertion=assertion,
             )
-        finally:
-            logging.getLogger().removeHandler(handler)
-        rendered = response.content.decode() + "\n".join(records)
         self.assertEqual(response.status_code, 200)
+        signature = assertion.rsplit(".", 1)[1]
+        capture.assert_absent(
+            self,
+            assertion,
+            signature,
+            claims["zoom_event_id"],
+            self.connection.user_id,
+            self.connection.account_id,
+            self.connection.object_id,
+            "refresh-marker-A",
+        )
         for marker in (
             assertion,
+            signature,
             claims["zoom_event_id"],
             self.connection.user_id,
             self.connection.account_id,
             self.connection.object_id,
             "refresh-marker-A",
         ):
-            self.assertNotIn(marker, rendered)
+            self.assertNotIn(marker, response.content.decode())
+
+    def test_resolver_readback_and_failed_settlement_logs_are_raw_free(self):
+        event_id = opaque_event_id()
+        resolve_claims = self.resolve_claims(event_id=event_id)
+        resolve_assertion = sign_claims(
+            resolve_claims,
+            private_key=self.private_key,
+        )
+
+        with CaptureZoomLogBytes() as capture:
+            resolved = self.post_assertion(
+                "/api/v1/zoom_retention/deauthorization/resolve",
+                resolve_claims,
+                assertion=resolve_assertion,
+            )
+            self.assertEqual(resolved.status_code, 200, resolved.content)
+
+            readback = self.client.get(
+                f"/api/v1/zoom_retention/operations/{resolved.json()['operation_id']}",
+                HTTP_AUTHORIZATION=f"Token {self.api_key}",
+            )
+            self.assertEqual(readback.status_code, 200, readback.content)
+
+            settle_claims = self.settle_claims(
+                event_id=event_id,
+                operation_id=uuid.UUID(resolved.json()["operation_id"]),
+                mode=EXISTING_ONLY,
+            )
+            settle_claims["temporal_evidence_digest"] = resolved.json()[
+                "temporal_evidence_digest"
+            ]
+            settle_assertion = sign_claims(
+                settle_claims,
+                private_key=self.private_key,
+            )
+            failed = self.post_assertion(
+                "/api/v1/zoom_retention/deauthorization",
+                settle_claims,
+                assertion=settle_assertion,
+            )
+
+        self.assertEqual(failed.status_code, 409, failed.content)
+        self.assertEqual(failed.json()["error"], "resolution_mismatch")
+        markers = (
+            resolve_assertion,
+            resolve_assertion.rsplit(".", 1)[1],
+            settle_assertion,
+            settle_assertion.rsplit(".", 1)[1],
+            event_id,
+            self.zoom_app.client_id,
+            self.connection.user_id,
+            self.connection.account_id,
+            self.connection.object_id,
+            "refresh-marker-A",
+        )
+        capture.assert_absent(self, *markers)
+        for response in (resolved, readback, failed):
+            rendered = response.content.decode()
+            for marker in markers:
+                self.assertNotIn(marker, rendered)
+
+    def test_unexpected_settlement_failure_middleware_logs_no_request_or_exception(self):
+        claims = self.settle_claims()
+        assertion = sign_claims(claims, private_key=self.private_key)
+        provider_marker = "settlement-provider-exception-body-canary"
+        original_raise_request_exception = self.client.raise_request_exception
+        self.client.raise_request_exception = False
+        try:
+            with override_settings(DEBUG=False), CaptureConfiguredZoomLogBytes() as capture, patch(
+                "bots.zoom_retention_api_views.settle_verified_deauthorization",
+                side_effect=RuntimeError(provider_marker),
+            ):
+                response = self.post_assertion(
+                    "/api/v1/zoom_retention/deauthorization",
+                    claims,
+                    assertion=assertion,
+                )
+        finally:
+            self.client.raise_request_exception = original_raise_request_exception
+
+        self.assertEqual(response.status_code, 500)
+        markers = (
+            provider_marker,
+            assertion,
+            assertion.rsplit(".", 1)[1],
+            claims["zoom_event_id"],
+            self.connection.user_id,
+            self.connection.account_id,
+            self.connection.object_id,
+            "refresh-marker-A",
+        )
+        capture.assert_absent(self, *markers)
+        for marker in markers:
+            self.assertNotIn(marker, response.content.decode())
 
     def test_oauth_callback_and_worker_failures_log_only_bounded_codes(self):
         authorization_marker = "authorization-code-log-canary"
@@ -2666,26 +2789,37 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             "authorization_code": authorization_marker,
             "redirect_uri": "https://client-agent.test/callback-log-canary",
         }
-        with patch(
+        with CaptureZoomLogBytes() as callback_logs, patch(
             "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens",
             side_effect=RuntimeError(provider_marker),
-        ), self.assertLogs("bots.zoom_oauth_connections_api_utils", level="ERROR") as callback_logs:
+        ):
             connection, error = create_zoom_oauth_connection(payload, self.project)
         self.assertIsNone(connection)
         self.assertIsNotNone(error)
-        callback_rendered = "\n".join(callback_logs.output)
-        self.assertNotIn(authorization_marker, callback_rendered)
-        self.assertNotIn(provider_marker, callback_rendered)
+        callback_logs.assert_absent(
+            self,
+            authorization_marker,
+            provider_marker,
+            payload["redirect_uri"],
+            self.zoom_app.client_id,
+        )
+        self.assertIn(b"code=token_exchange_failed", callback_logs.bytes)
 
-        with patch(
+        with CaptureZoomLogBytes() as worker_logs, patch(
             "bots.tasks.refresh_zoom_oauth_connection_task._get_access_token",
             side_effect=RuntimeError(provider_marker),
-        ), self.assertLogs("bots.tasks.refresh_zoom_oauth_connection_task", level="INFO") as worker_logs:
+        ):
             with self.assertRaises(Exception):
                 refresh_zoom_oauth_connection(self.connection.pk)
-        worker_rendered = "\n".join(worker_logs.output)
-        self.assertNotIn(provider_marker, worker_rendered)
-        self.assertNotIn(str(self.connection.pk), worker_rendered)
+        worker_logs.assert_absent(
+            self,
+            provider_marker,
+            self.connection.object_id,
+            self.connection.user_id,
+            self.connection.account_id,
+            "refresh-marker-A",
+        )
+        self.assertIn(b"code=provider_or_internal_error", worker_logs.bytes)
 
     def test_zoom_external_webhook_logs_no_raw_body_identifiers(self):
         meeting_marker = "meeting-log-canary"
@@ -2706,7 +2840,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             f"v0:{timestamp}:{body}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        with self.assertLogs("bots.external_webhooks_views", level="INFO") as webhook_logs:
+        with CaptureZoomLogBytes() as webhook_logs:
             response = self.client.post(
                 f"/external_webhooks/zoom/oauth_apps/{self.zoom_app.object_id}",
                 data=body,
@@ -2715,10 +2849,39 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 HTTP_X_ZM_REQUEST_TIMESTAMP=timestamp,
             )
         self.assertEqual(response.status_code, 200)
-        rendered = "\n".join(webhook_logs.output)
-        for marker in (body, meeting_marker, host_marker, operator_marker, self.zoom_app.object_id):
-            self.assertNotIn(marker, rendered)
-        self.assertIn("event_type=meeting.created", rendered)
+        webhook_logs.assert_absent(
+            self,
+            body,
+            meeting_marker,
+            host_marker,
+            operator_marker,
+            self.zoom_app.object_id,
+            signature,
+        )
+        self.assertIn(b"event_type=meeting.created", webhook_logs.bytes)
+
+        provider_error = "provider-error-body-log-canary"
+        signature_marker = "v0=signature-log-canary"
+        query_marker = "authorization-code-query-canary"
+        failed_body = json.dumps({"event": "other", "error": provider_error})
+        with CaptureZoomLogBytes() as rejected_logs:
+            rejected = self.client.post(
+                f"/external_webhooks/zoom/oauth_apps/{self.zoom_app.object_id}?code={query_marker}",
+                data=failed_body,
+                content_type="application/json",
+                HTTP_X_ZM_SIGNATURE=signature_marker,
+                HTTP_X_ZM_REQUEST_TIMESTAMP=timestamp,
+            )
+        self.assertEqual(rejected.status_code, 400)
+        rejected_logs.assert_absent(
+            self,
+            failed_body,
+            provider_error,
+            signature_marker,
+            query_marker,
+            self.zoom_app.object_id,
+        )
+        self.assertIn(b"code=invalid_signature", rejected_logs.bytes)
 
 
 class ZoomDeauthorizationAuditKeyringMigrationTests(TransactionTestCase):

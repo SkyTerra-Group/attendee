@@ -50,14 +50,17 @@ from bots.models import (
     ZoomRemovalOperationPhases,
     ZoomRemovalOperationSources,
     ZoomRemovalOperationStates,
+    ZoomRemovalOperationTypes,
 )
 from bots.tasks.launch_scheduled_bot_task import launch_scheduled_bot
 from bots.tasks.refresh_zoom_oauth_connection_task import refresh_zoom_oauth_connection
 from bots.tasks.sync_zoom_oauth_connection_task import sync_zoom_oauth_connection
 from bots.tasks.validate_zoom_oauth_connections_task import validate_zoom_oauth_connections
+from bots.tests.zoom_log_capture import CaptureZoomLogBytes
 from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
 from bots.zoom_oauth_connections_utils import ZoomOAuthConnectionRemovalFenced, _get_access_token
 from bots.zoom_retention import (
+    RECEIPT_RETENTION_DAYS,
     DatabaseVerificationError,
     OperationConflict,
     ProviderOutcome,
@@ -65,8 +68,10 @@ from bots.zoom_retention import (
     _delete_and_verify_storage,
     _revoke_at_zoom,
     delete_expired_receipts,
+    operation_result,
     process_bot_purge,
     process_connection_revoke,
+    target_digest,
 )
 
 
@@ -182,27 +187,51 @@ class ZoomRetentionTests(TransactionTestCase):
             response(200, {"status": "success"}),
         ]
 
-        stream = io.StringIO()
-        handler = logging.StreamHandler(stream)
-        logging.getLogger().addHandler(handler)
-        try:
+        with CaptureZoomLogBytes() as capture:
             result = self.post("/api/v1/zoom_retention/revoke", self.revoke_payload(connection, operation_id))
-        finally:
-            logging.getLogger().removeHandler(handler)
 
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["state"], ZoomRemovalOperationStates.REVOKED)
         self.assertFalse(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
         operation = ZoomRemovalOperation.objects.get(project=self.project, operation_id=operation_id)
         self.assertIsNone(operation.target_object_id)
+        self.assertEqual(operation.storage_manifest, {})
+        self.assertIsNone(operation.lease_token)
+        self.assertIsNone(operation.lease_expires_at)
         self.assertIsNotNone(operation.completed_at)
         self.assertIsNotNone(operation.expires_at)
+        self.assertEqual(
+            operation.expires_at - operation.completed_at,
+            timedelta(days=RECEIPT_RETENTION_DAYS),
+        )
+        self.assertEqual(
+            operation.target_digest,
+            target_digest(
+                self.project,
+                operation.operation_type,
+                connection.object_id,
+            ),
+        )
         self.assertEqual(post.call_args_list[0].args[0], "https://zoom.us/oauth/token")
         self.assertEqual(post.call_args_list[1].args[0], "https://zoom.us/oauth/revoke")
         self.assertNotIn("?", post.call_args_list[1].args[0])
-        rendered = result.content.decode() + stream.getvalue()
-        self.assertNotIn(refresh_token, rendered)
-        self.assertNotIn(access_token, rendered)
+        receipt_readback = json.dumps(operation_result(operation), sort_keys=True)
+        capture.assert_absent(
+            self,
+            refresh_token,
+            access_token,
+            connection.object_id,
+            connection.user_id,
+            connection.account_id,
+        )
+        for marker in (
+            refresh_token,
+            access_token,
+            connection.object_id,
+            connection.user_id,
+            connection.account_id,
+        ):
+            self.assertNotIn(marker, result.content.decode() + receipt_readback)
 
     @patch("bots.zoom_retention.requests.post")
     def test_ambiguous_network_revoke_is_not_success_and_keeps_credentials(self, post):
@@ -271,6 +300,21 @@ class ZoomRetentionTests(TransactionTestCase):
         self.assertTrue(ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(pk=mapping.pk).exists())
         self.assertTrue(WebhookDeliveryAttempt.objects.filter(pk=delivery_attempt.pk).exists())
         self.assertFalse(ZoomRemovalOperation.objects.exists())
+        generic_digest = target_digest(
+            self.project,
+            ZoomRemovalOperationTypes.REVOKE_CONNECTION,
+            connection.object_id,
+        )
+        self.assertRegex(generic_digest, r"^[0-9a-f]{64}$")
+        self.assertNotIn(connection.object_id, generic_digest)
+        self.assertNotEqual(
+            generic_digest,
+            target_digest(
+                self.project,
+                ZoomRemovalOperationTypes.PURGE_BOT,
+                connection.object_id,
+            ),
+        )
         post.assert_not_called()
 
     @patch("bots.zoom_retention.requests.post")
@@ -902,6 +946,10 @@ class ZoomRetentionTests(TransactionTestCase):
         receipt = ZoomRemovalOperation.objects.get(pk=first.pk)
         self.assertIsNone(receipt.target_object_id)
         self.assertEqual(receipt.storage_manifest, {})
+        self.assertEqual(
+            receipt.expires_at - receipt.completed_at,
+            timedelta(days=RECEIPT_RETENTION_DAYS),
+        )
 
     @patch("bots.zoom_retention._delete_and_verify_storage", return_value=None)
     def test_missing_target_is_never_inferred_purged_without_receipt(self, _storage):
@@ -999,7 +1047,10 @@ class ZoomRetentionTests(TransactionTestCase):
         bot = self.make_bot()
         with patch("bots.zoom_retention._delete_and_verify_storage", return_value=None):
             operation = process_bot_purge(project=self.project, operation_id=uuid.uuid4(), bot_object_id=bot.object_id)
-        self.assertGreater(operation.expires_at, operation.completed_at)
+        self.assertEqual(
+            operation.expires_at - operation.completed_at,
+            timedelta(days=RECEIPT_RETENTION_DAYS),
+        )
         ZoomRemovalOperation.objects.filter(pk=operation.pk).update(expires_at=timezone.now())
         self.assertEqual(delete_expired_receipts(), 1)
         self.assertFalse(ZoomRemovalOperation.objects.filter(pk=operation.pk).exists())

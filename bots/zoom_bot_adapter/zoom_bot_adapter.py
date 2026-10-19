@@ -8,6 +8,7 @@ import jwt
 import numpy as np
 import zoom_meeting_sdk as zoom
 
+from attendee.logging import log_bounded_exception
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
 from bots.meeting_url_utils import parse_zoom_join_url
@@ -242,11 +243,19 @@ class ZoomBotAdapter(BotAdapter):
             if joined_user and joined_user.IsHost():
                 logger.info("Re-requesting recording privilege since host just joined.")
                 self.recording_ctrl.RequestLocalRecordingPrivilege()
-        except Exception as e:
-            logger.warning(f"Error retrieving user in request_permission_to_record_if_joined_user_is_host: {e}")
+        except Exception as error:
+            log_bounded_exception(
+                logger,
+                "zoom_native_recording_permission_failed",
+                "participant_lookup_error",
+                error,
+            )
 
     def on_user_join_callback(self, joined_user_ids, _):
-        logger.info(f"on_user_join_callback called. joined_user_ids = {joined_user_ids}")
+        logger.info(
+            "zoom_native_participant_joined participant_count=%s",
+            len(joined_user_ids),
+        )
         self.update_only_one_participant_in_meeting_at()
         for joined_user_id in joined_user_ids:
             self.get_participant(joined_user_id)
@@ -273,7 +282,9 @@ class ZoomBotAdapter(BotAdapter):
             participant = self.get_participant(participant_id)
             if participant is None:
                 self.only_one_participant_in_meeting_at = None
-                logger.warning(f"only_one_participant_in_meeting_at set to None because participant {participant_id} is not available")
+                logger.warning(
+                    "zoom_native_single_participant_reset code=participant_unavailable"
+                )
                 return
             if not participant_is_another_bot(participant["participant_full_name"], participant["participant_is_the_bot"], self.automatic_leave_configuration):
                 all_participant_ids_excluding_other_bots.append(participant_id)
@@ -283,12 +294,18 @@ class ZoomBotAdapter(BotAdapter):
         if len(all_participant_ids_excluding_other_bots) == 1:
             if self.only_one_participant_in_meeting_at is None:
                 self.only_one_participant_in_meeting_at = time.time()
-                logger.info(f"only_one_participant_in_meeting_at set to {self.only_one_participant_in_meeting_at}. Ignoring other bots in meeting: {other_bots_in_meeting_names}")
+                logger.info(
+                    "zoom_native_single_participant_detected ignored_bot_count=%s",
+                    len(other_bots_in_meeting_names),
+                )
         else:
             self.only_one_participant_in_meeting_at = None
 
     def on_user_left_callback(self, left_user_ids, _):
-        logger.info(f"on_user_left_callback called. left_user_ids = {left_user_ids}")
+        logger.info(
+            "zoom_native_participant_left participant_count=%s",
+            len(left_user_ids),
+        )
         self.update_only_one_participant_in_meeting_at()
 
         for left_user_id in left_user_ids:
@@ -366,7 +383,13 @@ class ZoomBotAdapter(BotAdapter):
         if self.realtime_per_participant_video_frame_generator:
             self.realtime_per_participant_video_frame_generator.start()
 
-        logger.info(f"set_video_input_manager_based_on_state self.active_speaker_id = {self.active_speaker_id}, self.active_sharer_id = {self.active_sharer_id}, self.active_sharer_source_id = {self.active_sharer_source_id}")
+        logger.info(
+            "zoom_native_video_input_state_selected speaker_present=%s "
+            "sharer_present=%s source_present=%s",
+            self.active_speaker_id is not None,
+            self.active_sharer_id is not None,
+            self.active_sharer_source_id is not None,
+        )
         if self.active_sharer_id:
             self.video_input_manager.set_mode(
                 mode=VideoInputManager.Mode.ACTIVE_SHARER,
@@ -392,7 +415,9 @@ class ZoomBotAdapter(BotAdapter):
                     default_participant_id = participant_id
                     break
 
-            logger.info(f"set_video_input_manager_based_on_state hit default case. default_participant_id = {default_participant_id}")
+            logger.info(
+                "zoom_native_video_input_default_selected"
+            )
             self.video_input_manager.set_mode(
                 mode=VideoInputManager.Mode.ACTIVE_SPEAKER,
                 active_speaker_id=default_participant_id,
@@ -482,8 +507,13 @@ class ZoomBotAdapter(BotAdapter):
             }
             self._participant_cache[participant_id] = participant_info
             return participant_info
-        except:
-            logger.warning(f"Error getting participant {participant_id}, falling back to cache")
+        except Exception as error:
+            log_bounded_exception(
+                logger,
+                "zoom_native_participant_lookup_failed",
+                "cache_fallback",
+                error,
+            )
             return self._participant_cache.get(participant_id)
 
     def number_of_participants_ever_in_meeting_excluding_other_bots(self):
@@ -492,7 +522,10 @@ class ZoomBotAdapter(BotAdapter):
     def on_sharing_status_callback(self, sharing_info):
         user_id = sharing_info.userid
         sharing_status = sharing_info.status
-        logger.info(f"on_sharing_status_callback called. sharing_status = {sharing_status}, user_id = {user_id}")
+        logger.info(
+            "zoom_native_sharing_status_changed sharing_status=%s",
+            sharing_status,
+        )
 
         if sharing_status == zoom.Sharing_Other_Share_Begin or sharing_status == zoom.Sharing_View_Other_Sharing:
             new_active_sharer_id = user_id
@@ -997,7 +1030,10 @@ class ZoomBotAdapter(BotAdapter):
                 comma_separated_list=self.zoom_tokens.get("onbehalf_token"),
                 index=self.authorized_user_not_in_meeting_retries,
             )
-            logger.info(f"Using onbehalf token {(param.onBehalfToken or '')[:6]}...{(param.onBehalfToken or '')[-6:]} for retry {self.authorized_user_not_in_meeting_retries}")
+            logger.info(
+                "zoom_native_onbehalf_token_selected retry_count=%s",
+                self.authorized_user_not_in_meeting_retries,
+            )
         # Set the webinarToken only if joining a webinar as an attendee (in webinars, all attendees are in Guest Mode).
         # If joining as a signed-in bot (for panelists and co-hosts), use the ZAK token instead, and leave the webinarToken as NULL.
         if self.zoom_tokens.get("registrant_token") and not self.zoom_tokens.get("zak_token"):
@@ -1238,7 +1274,11 @@ class ZoomBotAdapter(BotAdapter):
         return self.mp4_demuxer.is_playing()
 
     def send_video(self, video_url, loop=False, mute_video=False):
-        logger.info(f"send_video called with video_url = {video_url}, loop = {loop}, mute_video = {mute_video}")
+        logger.info(
+            "zoom_native_send_video_started loop=%s mute_video=%s",
+            loop,
+            mute_video,
+        )
         if not self.unmute_webcam():
             return
 

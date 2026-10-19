@@ -17,6 +17,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from websockets.sync.server import serve
 
+from attendee.logging import log_bounded_exception
 from bots.automatic_leave_configuration import AutomaticLeaveConfiguration
 from bots.automatic_leave_utils import participant_is_another_bot
 from bots.bot_adapter import BotAdapter
@@ -154,11 +155,11 @@ class WebBotAdapter(BotAdapter):
         # If the meeting uuid is not set, then set it to the user's meeting id
         if not self.meeting_uuid:
             self.meeting_uuid = user.get("meetingId")
-            logger.info(f"meeting_uuid set to {self.meeting_uuid} for user {user}")
+            logger.info("zoom_web_meeting_uuid_initialized")
             return False
 
         if self.meeting_uuid != user.get("meetingId"):
-            logger.info(f"meeting_uuid mismatch detected. meeting_uuid: {self.meeting_uuid} user_meeting_id: {user.get('meetingId')} for user {user}")
+            logger.info("zoom_web_meeting_uuid_mismatch")
             return True
 
         return False
@@ -304,7 +305,10 @@ class WebBotAdapter(BotAdapter):
         if len(all_participants_in_meeting_excluding_other_bots) == 1 and all_participants_in_meeting_excluding_other_bots[0]["isCurrentUser"]:
             if self.only_one_participant_in_meeting_at is None:
                 self.only_one_participant_in_meeting_at = time.time()
-                logger.info(f"only_one_participant_in_meeting_at set to {self.only_one_participant_in_meeting_at}. Ignoring other bots in meeting: {other_bots_in_meeting_names}")
+                logger.info(
+                    "zoom_web_single_participant_detected ignored_bot_count=%s",
+                    len(other_bots_in_meeting_names),
+                )
         else:
             self.only_one_participant_in_meeting_at = None
 
@@ -326,14 +330,14 @@ class WebBotAdapter(BotAdapter):
         # If a meeting id was passed in the meeting ended message and we have one on the backend, then
         # only accept if they are equal
         if meeting_id and self.meeting_uuid and meeting_id != self.meeting_uuid:
-            logger.info(f"meeting id mismatch in handle_meeting_ended. meeting_id from message: {meeting_id} self.meeting_uuid: {self.meeting_uuid}")
+            logger.info("zoom_web_meeting_ended_id_mismatch")
             return
 
         self.left_meeting = True
         self.send_message_callback({"message": self.Messages.MEETING_ENDED, "remover": self.remover})
 
     def handle_failed_to_join(self, reason):
-        logger.info(f"failed to join meeting with reason {reason}")
+        logger.info("zoom_web_join_failed")
         self.subclass_specific_handle_failed_to_join(reason)
 
     def handle_caption_update(self, json_data):
@@ -721,7 +725,7 @@ class WebBotAdapter(BotAdapter):
         return False
 
     def repeatedly_attempt_to_join_meeting(self):
-        logger.info(f"Trying to join meeting at {self.meeting_url}")
+        logger.info("zoom_web_join_started")
 
         # Expected exceptions are ones that we expect to happen and are not a big deal, so we only increment num_retries once every three expected exceptions
         num_expected_exceptions = 0
@@ -821,15 +825,30 @@ class WebBotAdapter(BotAdapter):
                 num_retries += 1
             except Exception as e:
                 if num_retries >= max_retries:
-                    logger.exception(f"Failed to join meeting and the unexpected {e.__class__.__name__} exception with message {e.__str__()} is retryable but the number of retries exceeded the limit, so returning.")
+                    log_bounded_exception(
+                        logger,
+                        "zoom_web_join_failed",
+                        "retry_limit_exceeded",
+                        e,
+                    )
                     self.send_debug_screenshot_message(step="unknown", exception=e, inner_exception=None)
                     return
 
                 if self.left_meeting or self.cleaned_up:
-                    logger.exception(f"Failed to join meeting and the unexpected {e.__class__.__name__} exception with message {e.__str__()} is retryable but the bot has left the meeting or cleaned up, so returning.")
+                    log_bounded_exception(
+                        logger,
+                        "zoom_web_join_failed",
+                        "bot_inactive",
+                        e,
+                    )
                     return
 
-                logger.exception(f"Failed to join meeting and the unexpected {e.__class__.__name__} exception with message {e.__str__()} is retryable so retrying")
+                log_bounded_exception(
+                    logger,
+                    "zoom_web_join_failed",
+                    "retryable_internal_error",
+                    e,
+                )
 
                 num_retries += 1
 
@@ -958,8 +977,13 @@ class WebBotAdapter(BotAdapter):
                 url_normalized = url
 
             return str(urlparse(url_normalized).netloc)
-        except Exception as e:
-            logger.warning(f"Error normalizing history entry url: {e}")
+        except Exception as error:
+            log_bounded_exception(
+                logger,
+                "zoom_web_navigation_parse_failed",
+                "url_normalization_error",
+                error,
+            )
             return url
 
     def get_navigation_history_urls(self):
@@ -969,21 +993,35 @@ class WebBotAdapter(BotAdapter):
             nav_history = self.driver.execute_cdp_cmd("Page.getNavigationHistory", {})
             nav_history_entries = nav_history.get("entries", [])
             return [entry.get("url", "") for entry in nav_history_entries]
-        except Exception as e:
-            logger.warning(f"Error getting navigation history: {e}")
+        except Exception as error:
+            log_bounded_exception(
+                logger,
+                "zoom_web_navigation_read_failed",
+                "browser_history_error",
+                error,
+            )
             return []
 
     def log_browser_history(self):
         try:
             nav_history_urls = self.get_navigation_history_urls()
-            nav_history_hosts = list(set([self.domain_for_history_entry_url(url) for url in nav_history_urls]))
-            logger.info(f"Browser navigation history {nav_history_hosts}")
+            logger.info(
+                "zoom_web_navigation_history_checked entry_count=%s",
+                len(nav_history_urls),
+            )
             # If any of the navigation urls start with chrome://browser-switch, then the url was blocked.
             for url in nav_history_urls:
                 if url.startswith("chrome://browser-switch"):
-                    logger.error(f"Domain allow list violation detected after leave: {url}")
-        except Exception as e:
-            logger.warning(f"Error logging browser navigation history: {e}")
+                    logger.error(
+                        "zoom_web_domain_allowlist_violation code=blocked_after_leave"
+                    )
+        except Exception as error:
+            log_bounded_exception(
+                logger,
+                "zoom_web_navigation_history_failed",
+                "history_processing_error",
+                error,
+            )
 
     def check_domain_allow_list_violation(self):
         if not settings.ENFORCE_DOMAIN_ALLOWLIST_IN_CHROME:
@@ -1000,8 +1038,8 @@ class WebBotAdapter(BotAdapter):
         # If any of the navigation urls start with chrome://browser-switch, then the url was blocked.
         for url in nav_history_urls:
             if url.startswith("chrome://browser-switch"):
-                logger.error(f"Domain allow list violation detected: {url}")
-                raise Exception(f"Domain allow list violation detected: {self.domain_for_history_entry_url(url)}")
+                logger.error("zoom_web_domain_allowlist_violation code=blocked")
+                raise RuntimeError("zoom_web_domain_allowlist_violation")
 
     def check_auto_leave_conditions(self) -> None:
         if self.left_meeting:

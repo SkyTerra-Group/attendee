@@ -105,7 +105,16 @@ class ProviderOutcome:
 
 
 def target_digest(project: Project, operation_type: str, target_object_id: str) -> str:
-    """Return a domain-separated keyed digest without retaining the raw target."""
+    """Return the legacy S1 internal idempotency digest for a raw target.
+
+    This HMAC is scoped by project and operation type and derives a distinct
+    purpose key from the at-rest credential-encryption key.  It is not an
+    external identity or signed-deauthorization authority: that path requires
+    the exact app/grant/event binding and its separate audit-key registry.
+    Keeping this derivation preserves existing 30-day replay compatibility;
+    rotating the encryption key makes old generic target digests unavailable
+    for target-based deduplication until those bounded receipts expire.
+    """
 
     configured_key = settings.CREDENTIALS_ENCRYPTION_KEY
     if isinstance(configured_key, str):

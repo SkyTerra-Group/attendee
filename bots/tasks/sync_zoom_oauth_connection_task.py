@@ -3,9 +3,11 @@ import logging
 from django.db import transaction
 from django.utils import timezone
 
+from attendee.logging import log_bounded_exception
 from bots.models import ZoomOAuthConnection, ZoomOAuthConnectionStates
 from bots.zoom_oauth_connections_utils import (
     ZoomAPIAuthenticationError,
+    ZoomAPIError,
     ZoomOAuthConnectionRemovalFenced,
     _assert_zoom_oauth_connection_writable,
     _get_access_token,
@@ -43,9 +45,10 @@ def enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConn
 def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
     """Celery task to sync zoom meetings with a zoom oauth connection."""
     logger.info("zoom_oauth_sync_started")
-    zoom_oauth_connection = ZoomOAuthConnection.objects.get(id=zoom_oauth_connection_id)
+    zoom_oauth_connection = None
 
     try:
+        zoom_oauth_connection = ZoomOAuthConnection.objects.get(id=zoom_oauth_connection_id)
         # Set the sync start time
         sync_started_at = timezone.now()
 
@@ -78,10 +81,30 @@ def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
 
-    except Exception:
-        logger.error("zoom_oauth_sync_failed code=provider_or_internal_error")
-        try:
-            update_zoom_oauth_connection_if_writable(zoom_oauth_connection, last_attempted_sync_at=timezone.now())
-        except ZoomOAuthConnectionRemovalFenced:
-            return
-        raise
+    except ZoomOAuthConnection.DoesNotExist:
+        logger.error("zoom_oauth_sync_failed code=connection_not_found")
+        return
+
+    except Exception as error:
+        log_bounded_exception(
+            logger,
+            "zoom_oauth_sync_failed",
+            "provider_or_internal_error",
+            error,
+        )
+        if zoom_oauth_connection is not None:
+            try:
+                update_zoom_oauth_connection_if_writable(
+                    zoom_oauth_connection,
+                    last_attempted_sync_at=timezone.now(),
+                )
+            except ZoomOAuthConnectionRemovalFenced:
+                return
+            except Exception as status_error:
+                log_bounded_exception(
+                    logger,
+                    "zoom_oauth_sync_failed",
+                    "status_write_failed",
+                    status_error,
+                )
+        raise ZoomAPIError("zoom_oauth_sync_failed") from None

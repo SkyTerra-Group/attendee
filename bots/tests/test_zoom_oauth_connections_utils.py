@@ -11,6 +11,7 @@ from bots.models import (
     ZoomOAuthConnection,
     ZoomOAuthConnectionStates,
 )
+from bots.tests.zoom_log_capture import CaptureZoomLogBytes
 from bots.zoom_oauth_connections_utils import (
     ONBEHALF_TOKEN_FAILURE_CONNECTION_DOES_NOT_SUPPORT_ONBEHALF_TOKENS,
     ONBEHALF_TOKEN_FAILURE_CONNECTION_NOT_FOUND,
@@ -20,6 +21,7 @@ from bots.zoom_oauth_connections_utils import (
     ONBEHALF_TOKEN_FAILURE_ZOOM_API_ERROR,
     ONBEHALF_TOKEN_FAILURE_ZOOM_API_RETURNED_NO_TOKEN,
     ZoomAPIAuthenticationError,
+    ZoomAPIError,
     ZoomOnbehalfTokenUnavailableError,
     _handle_zoom_api_authentication_error,
     compute_zoom_webhook_validation_response,
@@ -111,8 +113,40 @@ class TestHandleZoomApiAuthenticationError(TestCase):
         self.zoom_oauth_connection.refresh_from_db()
         self.assertIsNotNone(self.zoom_oauth_connection.connection_failure_data)
         self.assertIn("error", self.zoom_oauth_connection.connection_failure_data)
-        self.assertIn("Invalid credentials", self.zoom_oauth_connection.connection_failure_data["error"])
+        self.assertEqual(
+            self.zoom_oauth_connection.connection_failure_data["error"],
+            "zoom_authentication_rejected",
+        )
+        self.assertNotIn(
+            "Invalid credentials",
+            str(self.zoom_oauth_connection.connection_failure_data),
+        )
         self.assertIn("timestamp", self.zoom_oauth_connection.connection_failure_data)
+
+    @patch("bots.zoom_oauth_connections_utils.trigger_webhook")
+    def test_webhook_failure_raises_only_fixed_error_and_logs_no_provider_text(
+        self,
+        mock_trigger_webhook,
+    ):
+        provider_marker = "auth-webhook-provider-error-canary"
+        mock_trigger_webhook.side_effect = RuntimeError(provider_marker)
+
+        with CaptureZoomLogBytes() as capture, self.assertRaises(ZoomAPIError) as raised:
+            _handle_zoom_api_authentication_error(
+                self.zoom_oauth_connection,
+                ZoomAPIAuthenticationError("auth-provider-body-canary"),
+            )
+
+        self.assertEqual(str(raised.exception), "zoom_auth_state_webhook_failed")
+        capture.assert_absent(
+            self,
+            provider_marker,
+            "auth-provider-body-canary",
+            self.zoom_oauth_connection.object_id,
+            self.zoom_oauth_connection.user_id,
+            self.zoom_oauth_connection.account_id,
+        )
+        self.assertIn(b"code=webhook_persistence_error", capture.bytes)
 
     @patch("bots.zoom_oauth_connections_utils.trigger_webhook")
     def test_triggers_webhook(self, mock_trigger_webhook):
@@ -222,10 +256,22 @@ class TestGetZoomTokensViaZoomOAuthApp(TestCase):
         bot = self._create_bot(use_web_adapter=True, onbehalf_user_id="test_user_id")
         self._mock_zoom_api_responses(mock_post, mock_session, local_recording_token="local_rec_token_123", onbehalf_token="onbehalf_token_456")
 
-        result = get_zoom_tokens_via_zoom_oauth_app(bot)
+        with CaptureZoomLogBytes() as capture:
+            result = get_zoom_tokens_via_zoom_oauth_app(bot)
 
         self.assertEqual(result["app_privilege_token"], "local_rec_token_123")
         self.assertEqual(result["onbehalf_token"], "onbehalf_token_456")
+        capture.assert_absent(
+            self,
+            "local_rec_token_123",
+            "onbehalf_token_456",
+            "mock_access_token",
+            self.zoom_oauth_connection.object_id,
+            self.zoom_oauth_connection.user_id,
+            self.zoom_oauth_connection.account_id,
+            self.meeting_id,
+            bot.meeting_url,
+        )
 
     @patch("bots.zoom_oauth_connections_utils.requests.Session")
     @patch("bots.zoom_oauth_connections_utils.requests.post")
@@ -290,19 +336,31 @@ class TestGetZoomTokensFailsClosedForOnbehalfBots(TestCase):
         self._mock_token_refresh(mock_post)
         requested_urls = []
 
+        provider_marker = "onbehalf-provider-error-body-canary"
+
         def send(request, **kwargs):
             requested_urls.append(request.url)
-            raise ConnectionError("Zoom API unreachable")
+            raise ConnectionError(provider_marker)
 
         self._mock_zoom_api(mock_session, send)
 
-        with self.assertRaises(ZoomOnbehalfTokenUnavailableError) as raised:
-            get_zoom_tokens_via_zoom_oauth_app(bot)
+        with CaptureZoomLogBytes() as capture:
+            with self.assertRaises(ZoomOnbehalfTokenUnavailableError) as raised:
+                get_zoom_tokens_via_zoom_oauth_app(bot)
 
         self.assertEqual(raised.exception.failure_reason, ONBEHALF_TOKEN_FAILURE_ZOOM_API_ERROR)
         # Only the onbehalf token was asked for; nothing else was fetched after it failed.
         self.assertEqual(len(requested_urls), 1)
         self.assertIn("token?type=onbehalf", requested_urls[0])
+        capture.assert_absent(
+            self,
+            provider_marker,
+            self.zoom_oauth_connection.object_id,
+            self.zoom_oauth_connection.user_id,
+            self.zoom_oauth_connection.account_id,
+            self.meeting_id,
+            bot.meeting_url,
+        )
 
     @patch("bots.zoom_oauth_connections_utils.trigger_webhook")
     @patch("bots.zoom_oauth_connections_utils.requests.Session")

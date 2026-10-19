@@ -8,6 +8,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
+from attendee.logging import log_bounded_exception
 from bots.models import SessionTypes, WebhookDeliveryAttempt, WebhookDeliveryAttemptStatus, WebhookTriggerTypes
 from bots.redis_utils import incr_and_expire_nx
 from bots.webhook_utils import sign_payload, url_is_public
@@ -57,8 +58,8 @@ def deliver_webhook(self, delivery_id):
     try:
         delivery = WebhookDeliveryAttempt.objects.get(id=delivery_id)
     except WebhookDeliveryAttempt.DoesNotExist:
-        logger.error(f"Webhook delivery attempt {delivery_id} not found")
-        raise  # Re-raises the original exception with preserved traceback
+        logger.error("webhook_delivery_failed code=delivery_not_found")
+        return
 
     subscription = delivery.webhook_subscription
 
@@ -123,9 +124,7 @@ def deliver_webhook(self, delivery_id):
     if is_global_webhook_rate_limit_reached():
         retry_delay = int(os.getenv("GLOBAL_WEBHOOK_RATE_LIMIT_RETRY_DELAY_SECONDS", 3))
         logger.warning(
-            "Global webhook deliveries per second rate limit of %s reached; retrying webhook delivery %s in %s seconds",
-            settings.GLOBAL_WEBHOOK_DELIVERIES_PER_SECOND_RATE_LIMIT,
-            delivery.id,
+            "webhook_delivery_deferred code=global_rate_limit retry_delay_seconds=%s",
             retry_delay,
         )
         raise self.retry(
@@ -169,6 +168,12 @@ def deliver_webhook(self, delivery_id):
 
     except requests.RequestException as e:
         # Handle network errors, timeouts, etc.
+        log_bounded_exception(
+            logger,
+            "webhook_delivery_failed",
+            "transport_error",
+            e,
+        )
         delivery.status = WebhookDeliveryAttemptStatus.FAILURE
         error_response = {
             "status_code": None,  # No HTTP status since request failed
@@ -183,7 +188,13 @@ def deliver_webhook(self, delivery_id):
     if delivery.status == WebhookDeliveryAttemptStatus.FAILURE:
         # Check if this was the last retry attempt
         if delivery.attempt_count >= MAX_WEBHOOK_DELIVERY_ATTEMPTS:
-            logger.error(f"Webhook delivery failed after {delivery.attempt_count} attempts. " + f"Webhook ID: {delivery.id}, URL: {subscription.url}, " + f"Event: {delivery.webhook_trigger_type}, Status: {delivery.status}")
+            logger.error(
+                "webhook_delivery_failed code=attempts_exhausted attempt_count=%s",
+                delivery.attempt_count,
+            )
         else:
-            logger.info(f"Retrying webhook delivery {delivery.id} (attempt {delivery.attempt_count}/{MAX_WEBHOOK_DELIVERY_ATTEMPTS})")
-            raise Exception("Retry due to failure")
+            logger.info(
+                "webhook_delivery_retry_scheduled attempt_count=%s",
+                delivery.attempt_count,
+            )
+            raise Exception("webhook_delivery_retry")

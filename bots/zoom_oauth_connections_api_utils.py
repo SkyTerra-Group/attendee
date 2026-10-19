@@ -6,6 +6,8 @@ import requests
 from django.conf import settings
 from django.db import IntegrityError, transaction
 
+from attendee.logging import bounded_exception_metadata, log_bounded_exception
+
 from .models import (
     ZoomOAuthApp,
     ZoomOAuthAuthorizationGrant,
@@ -109,8 +111,13 @@ def create_zoom_oauth_connection(data, project):
             client_id=zoom_oauth_app.client_id,
             client_secret=zoom_oauth_app.client_secret,
         )
-    except Exception:
-        logger.error("zoom_oauth_authorization_failed code=token_exchange_failed")
+    except Exception as error:
+        log_bounded_exception(
+            logger,
+            "zoom_oauth_authorization_failed",
+            "token_exchange_failed",
+            error,
+        )
         return None, {"error": "Error exchanging access code for tokens. Please check that the authorization code and redirect URI are correct."}
 
     # Validate that the tokens have the required scopes
@@ -133,8 +140,13 @@ def create_zoom_oauth_connection(data, project):
     user_info = None
     try:
         user_info = _get_user_info(zoom_oauth_tokens["access_token"])
-    except Exception:
-        logger.error("zoom_oauth_authorization_failed code=user_info_failed")
+    except Exception as error:
+        log_bounded_exception(
+            logger,
+            "zoom_oauth_authorization_failed",
+            "user_info_failed",
+            error,
+        )
         return None, {"error": "Error getting user info. Please check that the access token is valid."}
 
     # Validate that the user is active
@@ -224,11 +236,23 @@ def create_zoom_oauth_connection(data, project):
 
     except GrantCaptureUnavailable:
         return None, {"error": "Zoom authorization lineage could not be recorded safely."}
-    except IntegrityError:
+    except IntegrityError as error:
         error_id = str(uuid.uuid4())
-        logger.error("zoom_oauth_authorization_failed code=database_conflict error_id=%s", error_id)
+        exception_class, status_class = bounded_exception_metadata(error)
+        logger.error(
+            "zoom_oauth_authorization_failed code=database_conflict error_id=%s exception_class=%s http_status_class=%s",
+            error_id,
+            exception_class,
+            status_class,
+        )
         return None, {"non_field_errors": ["An error occurred while creating the zoom oauth connection. Error ID: " + error_id]}
-    except Exception:
+    except Exception as error:
         error_id = str(uuid.uuid4())
-        logger.error("zoom_oauth_authorization_failed code=internal_error error_id=%s", error_id)
+        exception_class, status_class = bounded_exception_metadata(error)
+        logger.error(
+            "zoom_oauth_authorization_failed code=internal_error error_id=%s exception_class=%s http_status_class=%s",
+            error_id,
+            exception_class,
+            status_class,
+        )
         return None, {"non_field_errors": ["An unexpected error occurred while creating the zoom oauth connection. Error ID: " + error_id]}

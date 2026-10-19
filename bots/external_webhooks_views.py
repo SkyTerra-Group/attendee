@@ -12,6 +12,8 @@ from django.utils.decorators import method_decorator
 from django.views import View
 from django.views.decorators.csrf import csrf_exempt
 
+from attendee.logging import log_bounded_exception
+
 from .models import CalendarNotificationChannel, ZoomOAuthApp, ZoomOAuthConnection
 from .stripe_utils import process_checkout_session_completed, process_customer_updated, process_payment_intent_succeeded
 from .zoom_oauth_connections_utils import _upsert_zoom_meeting_to_zoom_oauth_connection_mapping, _verify_zoom_webhook_signature, compute_zoom_webhook_validation_response
@@ -213,8 +215,13 @@ class ExternalWebhookZoomOAuthAppView(View):
         except ZoomOAuthApp.DoesNotExist:
             logger.error("zoom_external_webhook_rejected code=app_not_found")
             return HttpResponse(status=400)
-        except Exception:
-            logger.error("zoom_external_webhook_rejected code=processing_error")
+        except Exception as error:
+            log_bounded_exception(
+                logger,
+                "zoom_external_webhook_rejected",
+                "processing_error",
+                error,
+            )
             return HttpResponse(status=400)
         return HttpResponse(status=200)
 

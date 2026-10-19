@@ -67,7 +67,7 @@ class Command(BaseCommand):
             with open(SCHEDULER_HEARTBEAT_FILE, "w") as f:
                 f.write(str(time.time()))
         except Exception:
-            log.warning("Failed to write scheduler heartbeat file", exc_info=True)
+            log.warning("scheduler_heartbeat_write_failed code=io_error")
 
     def handle(self, *args, **opts):
         # Trap SIGINT / SIGTERM so Kubernetes or Heroku can stop the container cleanly
@@ -94,7 +94,9 @@ class Command(BaseCommand):
                 self._run_autopay_tasks()
                 delete_expired_receipts()
             except Exception:
-                log.exception("Scheduler cycle failed")
+                # This wrapper spans Zoom refresh/sync enqueueing. Do not let
+                # an arbitrary child exception reach scheduler trace output.
+                log.error("scheduler_cycle_failed code=internal_error")
             finally:
                 # Close stale connections so the loop never inherits a dead socket
                 connection.close()
@@ -153,8 +155,7 @@ class Command(BaseCommand):
         ).filter(Q(token_refresh_task_enqueued_at__isnull=True) | Q(token_refresh_task_enqueued_at__lte=cutoff_time) | Q(token_refresh_task_requested_at__isnull=False))
 
         for zoom_oauth_connection in zoom_oauth_connections:
-            last_enqueued = zoom_oauth_connection.token_refresh_task_enqueued_at.isoformat() if zoom_oauth_connection.token_refresh_task_enqueued_at else "never"
-            log.info("Launching zoom oauth connection token refresh for zoom oauth connection %s (last enqueued: %s)", zoom_oauth_connection.object_id, last_enqueued)
+            log.info("zoom_oauth_refresh_enqueued")
             enqueue_refresh_zoom_oauth_connection_task(zoom_oauth_connection)
 
         log.info("Launched %d zoom oauth connection token refresh tasks", len(zoom_oauth_connections))
@@ -174,8 +175,7 @@ class Command(BaseCommand):
         ).filter(Q(sync_task_enqueued_at__isnull=True) | Q(sync_task_enqueued_at__lte=cutoff_time) | Q(sync_task_requested_at__isnull=False))
 
         for zoom_oauth_connection in zoom_oauth_connections:
-            last_enqueued = zoom_oauth_connection.sync_task_enqueued_at.isoformat() if zoom_oauth_connection.sync_task_enqueued_at else "never"
-            log.info("Launching zoom oauth connection sync for zoom oauth connection %s (last enqueued: %s)", zoom_oauth_connection.object_id, last_enqueued)
+            log.info("zoom_oauth_sync_enqueued")
             enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection)
 
         log.info("Launched %d zoom oauth connection sync tasks", len(zoom_oauth_connections))

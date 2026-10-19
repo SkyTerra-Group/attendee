@@ -51,12 +51,12 @@ def sync_bot_with_calendar_event(bot: Bot, calendar_event: CalendarEvent):
     """Sync a bot with a calendar event."""
     # If the calendar event is deleted, delete the bot
     if calendar_event.is_deleted:
-        logger.info(f"Calendar event {calendar_event.platform_uuid} is deleted, deleting bot {bot.object_id}")
+        logger.info("calendar_sync_bot_delete_started")
         success, error = delete_bot(bot)
         if error:
-            logger.error(f"Failed to delete bot {bot.object_id}: {error}")
+            logger.error("calendar_sync_bot_delete_failed code=delete_rejected")
         else:
-            logger.info(f"Successfully deleted bot {bot.object_id}")
+            logger.info("calendar_sync_bot_delete_completed")
         return
 
     # Check if bot needs to be updated to match calendar event
@@ -64,22 +64,25 @@ def sync_bot_with_calendar_event(bot: Bot, calendar_event: CalendarEvent):
 
     # Check meeting_url
     if bot.meeting_url != calendar_event.meeting_url:
-        logger.info(f"Bot {bot.object_id} meeting_url differs from calendar event: {bot.meeting_url} -> {calendar_event.meeting_url}")
+        logger.info("calendar_sync_bot_field_changed field=meeting_url")
         update_data["meeting_url"] = calendar_event.meeting_url
 
     # Check join_at (bot.join_at should match calendar_event.start_time)
     if bot.join_at != calendar_event.start_time:
-        logger.info(f"Bot {bot.object_id} join_at differs from calendar event start_time: {bot.join_at} -> {calendar_event.start_time}")
+        logger.info("calendar_sync_bot_field_changed field=join_at")
         update_data["join_at"] = calendar_event.start_time
 
     # If updates are needed, patch the bot
     if update_data:
-        logger.info(f"Patching bot {bot.object_id} to sync with calendar event {calendar_event.platform_uuid} with data {update_data}")
+        logger.info(
+            "calendar_sync_bot_patch_started field_count=%s",
+            len(update_data),
+        )
         updated_bot, error = patch_bot(bot, update_data)
         if error:
-            logger.error(f"Failed to patch bot {bot.object_id}: {error}")
+            logger.error("calendar_sync_bot_patch_failed code=patch_rejected")
         else:
-            logger.info(f"Successfully patched bot {bot.object_id}")
+            logger.info("calendar_sync_bot_patch_completed")
 
 
 def sync_bots_for_calendar_event(calendar_event: CalendarEvent):

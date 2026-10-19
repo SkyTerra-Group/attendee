@@ -1,9 +1,14 @@
 import logging
+import uuid
 from typing import Dict, Optional
 
 import requests
 from django.conf import settings
 
+from attendee.logging import (
+    bounded_http_status_class,
+    log_bounded_exception,
+)
 from bots.models import WebhookSecret
 from bots.webhook_utils import sign_payload, url_is_public
 
@@ -25,10 +30,9 @@ class CallbackTimeoutError(CallbackError):
 class CallbackHTTPError(CallbackError):
     """Exception raised when a callback returns a non-success HTTP status"""
 
-    def __init__(self, message, status_code=None, response_body=None):
+    def __init__(self, message, status_code=None):
         super().__init__(message)
         self.status_code = status_code
-        self.response_body = response_body
 
 
 def make_callback_request(url: str, bot, callback_type: str, additional_data: Optional[Dict] = None) -> Dict:
@@ -68,8 +72,15 @@ def make_callback_request(url: str, bot, callback_type: str, additional_data: Op
     # Sign the payload
     signature = sign_payload(callback_data, active_secret.get_secret())
 
+    correlation_id = uuid.uuid4()
+    safe_callback_type = callback_type if callback_type in {"zoom_tokens"} else "other"
+
     try:
-        logger.info(f"Making {callback_type} callback request for bot {bot.object_id} to {url}")
+        logger.info(
+            "external_callback_started callback_type=%s correlation_id=%s",
+            safe_callback_type,
+            correlation_id,
+        )
 
         if settings.REQUIRE_PUBLIC_WEBHOOK_URLS and not url_is_public(url):
             raise CallbackError("Callback URL must be public")
@@ -86,34 +97,57 @@ def make_callback_request(url: str, bot, callback_type: str, additional_data: Op
             timeout=30,  # 30-second timeout
         )
 
-        # Log the response for debugging
-        logger.info(f"Callback response status: {response.status_code}")
+        status_class = bounded_http_status_class(response.status_code)
+        logger.info(
+            "external_callback_response callback_type=%s correlation_id=%s http_status_class=%s",
+            safe_callback_type,
+            correlation_id,
+            status_class,
+        )
 
         # Check if the request was successful (2xx status code)
         if not (200 <= response.status_code < 300):
-            error_msg = f"Callback request failed with status {response.status_code}"
-            response_body = response.text[:1000]  # Limit response body logging
-            logger.error(f"{error_msg}. Response: {response_body}")
-            raise CallbackHTTPError(error_msg, status_code=response.status_code, response_body=response_body)
+            logger.error(
+                "external_callback_failed code=http_error callback_type=%s correlation_id=%s http_status_class=%s",
+                safe_callback_type,
+                correlation_id,
+                status_class,
+            )
+            raise CallbackHTTPError(
+                "external_callback_http_error",
+                status_code=response.status_code,
+            )
 
         # Parse the JSON response
         try:
             response_data = response.json()
-        except ValueError as e:
-            error_msg = f"Invalid JSON response from callback: {str(e)}"
-            logger.error(error_msg)
-            raise CallbackError(error_msg)
+        except ValueError as error:
+            log_bounded_exception(
+                logger,
+                "external_callback_failed",
+                "invalid_json",
+                error,
+            )
+            raise CallbackError("external_callback_invalid_json") from None
 
-        logger.info(f"Callback request successful for bot {bot.object_id}")
+        logger.info(
+            "external_callback_completed callback_type=%s correlation_id=%s",
+            safe_callback_type,
+            correlation_id,
+        )
         return response_data
 
-    except requests.RequestException as e:
-        error_msg = f"Network error during callback request: {str(e)}"
-        logger.error(error_msg)
-        if isinstance(e, requests.Timeout):
-            raise CallbackTimeoutError(error_msg)
+    except requests.RequestException as error:
+        log_bounded_exception(
+            logger,
+            "external_callback_failed",
+            "transport_error",
+            error,
+        )
+        if isinstance(error, requests.Timeout):
+            raise CallbackTimeoutError("external_callback_timeout") from None
         else:
-            raise CallbackError(error_msg)
+            raise CallbackError("external_callback_transport_error") from None
 
 
 def get_zoom_tokens(bot) -> Dict[str, str]:
@@ -154,7 +188,7 @@ def get_zoom_tokens(bot) -> Dict[str, str]:
 
     # Verify response_data is a dict
     if not isinstance(response_data, dict):
-        logger.error(f"Invalid response data from callback: {response_data}")
+        logger.error("zoom_tokens_callback_failed code=invalid_response_shape")
         return tokens
 
     # Extract tokens, setting to None if missing or invalid
@@ -164,5 +198,5 @@ def get_zoom_tokens(bot) -> Dict[str, str]:
         if isinstance(token_value, str) and token_value.strip():
             tokens[field] = token_value
 
-    logger.info(f"Retrieved zoom tokens for bot {bot.object_id}")
+    logger.info("zoom_tokens_callback_completed")
     return tokens
