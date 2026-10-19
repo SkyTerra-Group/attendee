@@ -425,5 +425,5 @@ if os.getenv("ENABLE_CSP", "false") == "true":
         },
     }
 
-# Initialize Sentry (only if SENTRY_DSN is set)
+# Fail closed: this Zoom-capable service does not initialize Sentry, even with a DSN.
 init_sentry()

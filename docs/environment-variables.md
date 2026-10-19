@@ -193,8 +193,16 @@ This document lists all supported environment variables for the Attendee applica
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `SENTRY_DSN` | String | (None) | Sentry Data Source Name (DSN) for error tracking. Sentry is disabled if not set. |
-| `SENTRY_ENVIRONMENT` | String | `production` | Sentry environment name (e.g., `development`, `staging`, `production`). |
-| `SENTRY_TRACES_SAMPLE_RATE` | Float | `0.1` | Sample rate for performance tracing (0.0 to 1.0, where 1.0 means 100%). |
-| `SENTRY_PROFILES_SAMPLE_RATE` | Float | `0.1` | Sample rate for profiling data (0.0 to 1.0). |
-| `SENTRY_SEND_PII` | Boolean | `false` | Include personally identifiable information (PII) in Sentry reports. Set to `true` only for development. |
+| `SENTRY_DSN` | String | (None) | Ignored: external Sentry telemetry is disabled for this Zoom-capable service, including when a DSN is configured. |
+| `SENTRY_ENVIRONMENT` | String | (Unused) | Ignored while Sentry telemetry is disabled. |
+| `SENTRY_TRACES_SAMPLE_RATE` | Float | (Unused) | Ignored while Sentry telemetry is disabled. |
+| `SENTRY_PROFILES_SAMPLE_RATE` | Float | (Unused) | Ignored while Sentry telemetry is disabled. |
+| `SENTRY_SEND_PII` | Boolean | (Unused) | Ignored while Sentry telemetry is disabled; setting it cannot enable telemetry. |
+
+Sentry has no runtime opt-in in this build. Disabling request bodies and traceback
+locals alone does not remove raw exception messages or other event fields. The
+service therefore emits the fixed `sentry_telemetry_disabled` startup diagnostic
+and keeps ordinary console logging, without initializing Sentry integrations.
+Deployment must use the repository entrypoints without an externally injected
+Sentry initializer. This policy does not remove historical Sentry events or prove
+that console, native SDK, ingress, and platform logs contain no identifiers.

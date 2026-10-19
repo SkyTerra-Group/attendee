@@ -1,30 +1,23 @@
-import os
+import logging
 
-import sentry_sdk
-from sentry_sdk.integrations.celery import CeleryIntegration
-from sentry_sdk.integrations.django import DjangoIntegration
-from sentry_sdk.integrations.redis import RedisIntegration
+
+logger = logging.getLogger(__name__)
 
 
 def init_sentry():
-    dsn = os.getenv("SENTRY_DSN")
-    if not dsn:
-        return
+    """Keep external SDK telemetry disabled for this Zoom-capable service.
 
-    sentry_sdk.init(
-        dsn=dsn,
-        integrations=[
-            DjangoIntegration(),
-            CeleryIntegration(),
-            RedisIntegration(),
-        ],
-        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
-        profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1")),
-        environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
-        send_default_pii=os.getenv("SENTRY_SEND_PII", "false") == "true",
-        # Trust-boundary request bodies can contain compact assertions, OAuth
-        # codes, or provider tokens. Never attach them, and do not serialize
-        # traceback locals that may hold those same values.
-        max_request_body_size="never",
-        include_local_variables=False,
+    Disabling request bodies and traceback locals does not remove exception
+    values, breadcrumbs or other envelope fields. Generic Django/Celery/bot
+    work cannot reliably be classified as non-Zoom at this boundary. Until a
+    whole-envelope policy is reviewed, even a configured DSN must not install
+    the SDK integrations. There is deliberately no environment bypass.
+
+    This does not sanitize historical Sentry events or an SDK initialized by
+    external instrumentation. Deployment must use the repository entrypoints
+    without an injected Sentry initializer. Ordinary console logging remains.
+    """
+    logger.warning(
+        "sentry_telemetry_disabled code=zoom_sensitive_service "
+        "console_diagnostics=enabled"
     )
