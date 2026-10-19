@@ -276,6 +276,10 @@ class ZoomOAuthApp(models.Model):
 
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="zoom_oauth_apps")
     object_id = models.CharField(max_length=32, unique=True, editable=False)
+    # This is the cross-service identity for one exact Zoom application.  It is
+    # deliberately independent of the provider client id and is immutable once
+    # allocated.
+    deauthorization_binding_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     _encrypted_data = models.BinaryField(
         null=True,
@@ -311,6 +315,10 @@ class ZoomOAuthApp(models.Model):
         return json.loads(decrypted_data.decode())
 
     def save(self, *args, **kwargs):
+        if self.pk:
+            persisted_binding = type(self).objects.filter(pk=self.pk).values_list("deauthorization_binding_id", flat=True).first()
+            if persisted_binding and persisted_binding != self.deauthorization_binding_id:
+                raise ValidationError("Zoom OAuth app deauthorization binding is immutable")
         if not self.object_id:
             # Generate a random 16-character string
             random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
@@ -409,6 +417,93 @@ class ZoomOAuthConnection(models.Model):
         ]
 
 
+class ZoomOAuthAuthorizationLineage(models.Model):
+    """Permanent, non-readable authorization history for one provider identity."""
+
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="zoom_oauth_authorization_lineages")
+    zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="authorization_lineages")
+    identity_digest = models.CharField(max_length=64)
+    latest_grant_sequence = models.PositiveIntegerField(default=0)
+    has_prior_grant = models.BooleanField(default=False)
+    history_complete = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "zoom_oauth_app", "identity_digest"],
+                name="unique_zoom_oauth_authorization_lineage",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(latest_grant_sequence__gte=0),
+                name="zoom_lineage_sequence_nonnegative",
+            ),
+        ]
+
+
+class ZoomOAuthAuthorizationGrant(models.Model):
+    """Immutable grant interval; only ``generation_ended_at`` closes it."""
+
+    binding_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="zoom_oauth_authorization_grants")
+    zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="authorization_grants")
+    lineage = models.ForeignKey(ZoomOAuthAuthorizationLineage, on_delete=models.PROTECT, related_name="grants")
+    grant_sequence = models.PositiveIntegerField()
+    live_connection = models.OneToOneField(
+        ZoomOAuthConnection,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="authorization_grant",
+    )
+    connection_digest = models.CharField(max_length=64)
+    identity_digest = models.CharField(max_length=64)
+    authorization_generation = models.UUIDField()
+    generation_started_at = models.DateTimeField()
+    generation_ended_at = models.DateTimeField(null=True, blank=True)
+    start_clock_health_id = models.CharField(max_length=64)
+    end_clock_health_id = models.CharField(max_length=64, null=True, blank=True)
+    start_clock_error_ms = models.PositiveIntegerField(default=0)
+    end_clock_error_ms = models.PositiveIntegerField(null=True, blank=True)
+    start_clock_continuous = models.BooleanField(default=True)
+    end_clock_continuous = models.BooleanField(null=True, blank=True)
+    legacy_history = models.BooleanField(default=False)
+    canonical_removal_operation = models.OneToOneField(
+        "ZoomRemovalOperation",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="canonical_for_authorization_grant",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["lineage", "grant_sequence"], name="unique_zoom_grant_lineage_sequence"),
+            models.UniqueConstraint(
+                fields=["project", "zoom_oauth_app", "connection_digest", "authorization_generation"],
+                name="unique_zoom_authorization_grant_binding",
+            ),
+            models.CheckConstraint(condition=models.Q(grant_sequence__gte=1), name="zoom_grant_sequence_positive"),
+            models.CheckConstraint(
+                condition=models.Q(generation_ended_at__isnull=True) | models.Q(generation_ended_at__gt=models.F("generation_started_at")),
+                name="zoom_grant_interval_ordered",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(generation_ended_at__isnull=True, end_clock_health_id__isnull=True, end_clock_error_ms__isnull=True, end_clock_continuous__isnull=True)
+                    | models.Q(generation_ended_at__isnull=False, end_clock_health_id__isnull=False, end_clock_error_ms__isnull=False, end_clock_continuous__isnull=False)
+                ),
+                name="zoom_grant_end_evidence_complete",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["project", "zoom_oauth_app", "identity_digest"], name="zoom_grant_identity_idx"),
+        ]
+
+
 class ZoomRemovalOperationTypes(models.TextChoices):
     REVOKE_CONNECTION = "revoke_connection", "Revoke connection"
     PURGE_BOT = "purge_bot", "Purge bot"
@@ -447,12 +542,30 @@ class ZoomRemovalOperation(models.Model):
     """
 
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="zoom_removal_operations")
+    # Retained only as an unindexed compatibility mirror for pre-S5 internal
+    # ORM consumers. It is not an addressable namespace: every API lookup and
+    # collision decision goes through ZoomRemovalOperationIdentifier.
     operation_id = models.UUIDField()
     operation_type = models.CharField(max_length=32, choices=ZoomRemovalOperationTypes.choices)
     source = models.CharField(max_length=32, choices=ZoomRemovalOperationSources.choices, null=True, blank=True)
     target_digest = models.CharField(max_length=64)
     target_object_id = models.CharField(max_length=32, null=True, blank=True)
     target_generation = models.UUIDField(null=True, blank=True)
+    authorization_grant = models.ForeignKey(
+        ZoomOAuthAuthorizationGrant,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="removal_operations",
+    )
+    zoom_oauth_app_binding = models.UUIDField(null=True, blank=True)
+    connection_digest = models.CharField(max_length=64, null=True, blank=True)
+    app_digest = models.CharField(max_length=64, null=True, blank=True)
+    verified_deauthorization_event_digest = models.CharField(max_length=64, null=True, blank=True)
+    verified_deauthorization_at = models.DateTimeField(null=True, blank=True)
+    provider_revoke_settled_at = models.DateTimeField(null=True, blank=True)
+    signed_deauthorization_settled_at = models.DateTimeField(null=True, blank=True)
+    terminal_basis = models.CharField(max_length=32, null=True, blank=True)
     state = models.CharField(max_length=32, choices=ZoomRemovalOperationStates.choices, default=ZoomRemovalOperationStates.PENDING)
     phase = models.CharField(max_length=32, choices=ZoomRemovalOperationPhases.choices, default=ZoomRemovalOperationPhases.PENDING)
     failure_code = models.CharField(max_length=64, null=True, blank=True)
@@ -467,7 +580,6 @@ class ZoomRemovalOperation(models.Model):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["project", "operation_id"], name="unique_zoom_removal_operation_id_per_project"),
             models.UniqueConstraint(
                 fields=["project", "operation_type", "target_digest"],
                 condition=models.Q(operation_type=ZoomRemovalOperationTypes.PURGE_BOT),
@@ -475,13 +587,262 @@ class ZoomRemovalOperation(models.Model):
             ),
             models.UniqueConstraint(
                 fields=["project", "operation_type", "target_digest", "target_generation"],
-                condition=models.Q(operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION),
+                condition=models.Q(operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION, authorization_grant__isnull=True),
                 nulls_distinct=False,
                 name="unique_zoom_revoke_target_generation",
             ),
+            models.UniqueConstraint(
+                fields=["project", "authorization_grant", "operation_type"],
+                condition=models.Q(operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION, authorization_grant__isnull=False),
+                name="unique_zoom_revoke_authorization_grant",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "app_digest", "verified_deauthorization_event_digest"],
+                condition=models.Q(verified_deauthorization_event_digest__isnull=False),
+                name="unique_zoom_verified_deauth_event",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(provider_revoke_settled_at__isnull=True, signed_deauthorization_settled_at__isnull=True, terminal_basis__isnull=True)
+                    | models.Q(provider_revoke_settled_at__isnull=False, signed_deauthorization_settled_at__isnull=True, terminal_basis="provider_revoke")
+                    | models.Q(provider_revoke_settled_at__isnull=True, signed_deauthorization_settled_at__isnull=False, terminal_basis="signed_zoom_deauthorization")
+                    | models.Q(provider_revoke_settled_at__isnull=False, signed_deauthorization_settled_at__isnull=False, terminal_basis="provider_and_signed")
+                ),
+                name="zoom_removal_terminal_basis_matches_evidence",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(verified_deauthorization_event_digest__isnull=True, verified_deauthorization_at__isnull=True)
+                    | models.Q(verified_deauthorization_event_digest__isnull=False, verified_deauthorization_at__isnull=False)
+                ),
+                name="zoom_removal_signed_event_evidence_complete",
+            ),
+        ]
+
+
+class ZoomRemovalOperationIdentifierRoles(models.TextChoices):
+    CANONICAL = "canonical", "Canonical"
+    ALTERNATE = "alternate", "Alternate"
+
+
+class ZoomRemovalOperationIdentifier(models.Model):
+    """The sole externally addressable namespace for removal operation UUIDs."""
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="zoom_removal_operation_identifiers")
+    identifier_uuid = models.UUIDField()
+    operation = models.ForeignKey(ZoomRemovalOperation, on_delete=models.CASCADE, related_name="identifiers")
+    role = models.CharField(max_length=16, choices=ZoomRemovalOperationIdentifierRoles.choices)
+    grant_binding_digest = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["project", "identifier_uuid"], name="unique_zoom_operation_identifier_namespace"),
+            models.UniqueConstraint(
+                fields=["operation"],
+                condition=models.Q(role=ZoomRemovalOperationIdentifierRoles.CANONICAL),
+                name="one_canonical_identifier_per_zoom_operation",
+            ),
         ]
         indexes = [
-            models.Index(fields=["project", "operation_id"], name="zoom_remove_project_op_idx"),
+            models.Index(fields=["project", "identifier_uuid"], name="zoom_operation_identifier_idx"),
+        ]
+
+
+class ZoomDeauthorizationEventBinding(models.Model):
+    """Permanent replay tombstone and frozen grant evidence for one signed event."""
+
+    binding_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    binding_version = models.PositiveIntegerField(default=1)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="zoom_deauthorization_event_bindings")
+    zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="deauthorization_event_bindings")
+    lineage = models.ForeignKey(ZoomOAuthAuthorizationLineage, on_delete=models.PROTECT, related_name="deauthorization_event_bindings")
+    authorization_grant = models.ForeignKey(
+        ZoomOAuthAuthorizationGrant,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deauthorization_event_bindings",
+    )
+    operation = models.ForeignKey(
+        ZoomRemovalOperation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deauthorization_event_bindings",
+    )
+    event_digest = models.CharField(max_length=64)
+    app_digest = models.CharField(max_length=64)
+    grant_binding_id = models.UUIDField()
+    connection_digest = models.CharField(max_length=64)
+    authorization_generation = models.UUIDField()
+    temporal_policy = models.CharField(max_length=64)
+    candidate_evidence_digest = models.CharField(max_length=64)
+    binding_evidence_digest = models.CharField(max_length=64)
+    evidence_snapshot = models.JSONField()
+    terminal_result_digest = models.CharField(max_length=64, null=True, blank=True)
+    terminal_state = models.CharField(max_length=32, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "zoom_oauth_app", "event_digest"],
+                name="unique_zoom_deauthorization_event_binding",
+            ),
+            models.UniqueConstraint(
+                fields=["operation"],
+                condition=models.Q(operation__isnull=False),
+                name="unique_zoom_deauthorization_binding_operation",
+            ),
+            models.CheckConstraint(condition=models.Q(binding_version__gte=1), name="zoom_event_binding_version_positive"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(terminal_result_digest__isnull=True, terminal_state__isnull=True)
+                    | models.Q(terminal_result_digest__isnull=False, terminal_state__isnull=False)
+                ),
+                name="zoom_event_binding_terminal_evidence_complete",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["project", "zoom_oauth_app", "event_digest"], name="zoom_event_binding_lookup_idx"),
+        ]
+
+
+class ZoomDeauthorizationResolutionOutcomes(models.TextChoices):
+    RESOLVED = "resolved", "Resolved"
+    RESOLVED_EXISTING_BINDING = "resolved_existing_binding", "Resolved existing binding"
+    UNRESOLVED_NO_MATCH = "unresolved_no_match", "No match"
+    UNRESOLVED_AMBIGUOUS = "unresolved_ambiguous", "Ambiguous"
+    UNRESOLVED_TEMPORAL_ORDER = "unresolved_temporal_order", "Temporal order"
+    UNRESOLVED_PROVIDER_CLOCK = "unresolved_provider_clock", "Provider clock"
+    DELAYED_EVENT_UNBOUND = "delayed_event_unbound", "Delayed event unbound"
+    CLOCK_UNTRUSTED = "clock_untrusted", "Clock untrusted"
+    BOUND_EVENT_RESULT_EXPIRED = "bound_event_result_expired", "Bound result expired"
+
+
+class ZoomDeauthorizationTargetResolution(models.Model):
+    resolution_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name="zoom_deauthorization_resolutions")
+    zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="deauthorization_resolutions")
+    event_digest = models.CharField(max_length=64)
+    outcome = models.CharField(max_length=40, choices=ZoomDeauthorizationResolutionOutcomes.choices)
+    event_binding = models.ForeignKey(
+        ZoomDeauthorizationEventBinding,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="resolutions",
+    )
+    authorization_grant = models.ForeignKey(
+        ZoomOAuthAuthorizationGrant,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deauthorization_resolutions",
+    )
+    operation = models.ForeignKey(
+        ZoomRemovalOperation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="deauthorization_resolutions",
+    )
+    grant_binding_id = models.UUIDField(null=True, blank=True)
+    connection_digest = models.CharField(max_length=64, null=True, blank=True)
+    authorization_generation = models.UUIDField(null=True, blank=True)
+    binding_evidence_digest = models.CharField(max_length=64, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "zoom_oauth_app", "event_digest"],
+                name="unique_zoom_deauthorization_resolution",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        outcome__in=[
+                            ZoomDeauthorizationResolutionOutcomes.RESOLVED,
+                            ZoomDeauthorizationResolutionOutcomes.RESOLVED_EXISTING_BINDING,
+                        ],
+                        event_binding__isnull=False,
+                        authorization_grant__isnull=False,
+                        operation__isnull=False,
+                        grant_binding_id__isnull=False,
+                        connection_digest__isnull=False,
+                        authorization_generation__isnull=False,
+                        binding_evidence_digest__isnull=False,
+                    )
+                    | models.Q(
+                        outcome__in=[
+                            ZoomDeauthorizationResolutionOutcomes.UNRESOLVED_NO_MATCH,
+                            ZoomDeauthorizationResolutionOutcomes.UNRESOLVED_AMBIGUOUS,
+                            ZoomDeauthorizationResolutionOutcomes.UNRESOLVED_TEMPORAL_ORDER,
+                            ZoomDeauthorizationResolutionOutcomes.UNRESOLVED_PROVIDER_CLOCK,
+                            ZoomDeauthorizationResolutionOutcomes.DELAYED_EVENT_UNBOUND,
+                            ZoomDeauthorizationResolutionOutcomes.CLOCK_UNTRUSTED,
+                        ],
+                        event_binding__isnull=True,
+                        authorization_grant__isnull=True,
+                        operation__isnull=True,
+                        grant_binding_id__isnull=True,
+                        connection_digest__isnull=True,
+                        authorization_generation__isnull=True,
+                        binding_evidence_digest__isnull=True,
+                    )
+                    | models.Q(
+                        outcome=ZoomDeauthorizationResolutionOutcomes.BOUND_EVENT_RESULT_EXPIRED,
+                        event_binding__isnull=False,
+                        authorization_grant__isnull=True,
+                        operation__isnull=True,
+                    )
+                ),
+                name="zoom_deauth_resolution_target_shape",
+            ),
+        ]
+
+
+class ZoomDeauthorizationAssertionReceipt(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="zoom_deauthorization_assertion_receipts")
+    zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="deauthorization_assertion_receipts")
+    issuer_id = models.CharField(max_length=255)
+    key_id = models.CharField(max_length=128)
+    nonce_digest = models.CharField(max_length=64)
+    claims_digest = models.CharField(max_length=64)
+    purpose = models.CharField(max_length=64)
+    binding_mode = models.CharField(max_length=32)
+    operation = models.ForeignKey(
+        ZoomRemovalOperation,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="deauthorization_assertion_receipts",
+    )
+    resolution = models.ForeignKey(
+        ZoomDeauthorizationTargetResolution,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="assertion_receipts",
+    )
+    received_at = models.DateTimeField()
+    expires_at = models.DateTimeField(db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "zoom_oauth_app", "issuer_id", "nonce_digest"],
+                name="unique_zoom_deauth_assertion_nonce",
+            ),
+            models.CheckConstraint(
+                condition=(models.Q(purpose="zoom-deauthorization:settle", operation__isnull=False, resolution__isnull=True)
+                | models.Q(purpose="zoom-deauthorization:resolve", operation__isnull=True, resolution__isnull=False)),
+                name="zoom_assertion_receipt_target_matches_purpose",
+            ),
         ]
 
 

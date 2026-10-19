@@ -36,7 +36,7 @@ def enqueue_refresh_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthC
 )
 def refresh_zoom_oauth_connection(self, zoom_oauth_connection_id):
     """Celery task to refresh the token for a zoom oauth connection."""
-    logger.info(f"Refreshing zoom oauth connection token for zoom oauth connection {zoom_oauth_connection_id}")
+    logger.info("zoom_oauth_refresh_started")
     zoom_oauth_connection = ZoomOAuthConnection.objects.get(id=zoom_oauth_connection_id)
 
     try:
@@ -56,7 +56,7 @@ def refresh_zoom_oauth_connection(self, zoom_oauth_connection_id):
             connection_failure_data=None,
         )
 
-        logger.info(f"Successfully refreshed zoom oauth connection token for zoom oauth connection {zoom_oauth_connection_id}")
+        logger.info("zoom_oauth_refresh_completed")
 
     except ZoomOAuthConnectionRemovalFenced:
         return
@@ -64,8 +64,8 @@ def refresh_zoom_oauth_connection(self, zoom_oauth_connection_id):
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
 
-    except Exception as e:
-        logger.exception(f"Zoom OAuth connection token refresh failed with {type(e).__name__} for {zoom_oauth_connection_id}: {e}")
+    except Exception:
+        logger.error("zoom_oauth_refresh_failed code=provider_or_internal_error")
         try:
             update_zoom_oauth_connection_if_writable(zoom_oauth_connection, last_attempted_token_refresh_at=timezone.now())
         except ZoomOAuthConnectionRemovalFenced:

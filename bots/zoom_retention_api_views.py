@@ -9,6 +9,20 @@ from rest_framework.response import Response
 from .authentication import ApiKeyAuthentication
 from .models import Bot, ZoomRemovalOperationSources
 from .throttling import ProjectPostThrottle
+from .zoom_deauthorization import (
+    CommittedDeauthorizationError,
+    DeauthorizationServiceError,
+    resolve_verified_deauthorization,
+    settle_verified_deauthorization,
+)
+from .zoom_deauthorization_assertion import (
+    MAX_ASSERTION_BYTES,
+    RESOLVE_PURPOSE,
+    SETTLE_PURPOSE,
+    AssertionRejected,
+    verify_deauthorization_assertion,
+)
+from .zoom_deauthorization_grants import database_clock_now
 from .zoom_retention import (
     MAX_PURGE_TARGETS,
     CrossProjectTarget,
@@ -46,6 +60,66 @@ def _safe_conflict_response(error):
     if error.canonical_operation_id:
         body["canonical_operation_id"] = str(error.canonical_operation_id)
     return Response(body, status=status.HTTP_409_CONFLICT)
+
+
+def _signed_error_response(error):
+    body = {"error": error.code}
+    if error.operation_id:
+        body["operation_id"] = str(error.operation_id)
+    body.update(error.recovery or {})
+    return Response(body, status=error.status_code)
+
+
+def _verified_assertion(request, purpose):
+    try:
+        content_length = int(request.META.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        raise AssertionRejected("invalid_request") from None
+    if content_length <= 0 or content_length > MAX_ASSERTION_BYTES:
+        raise AssertionRejected("invalid_request")
+    if type(request.data) is not dict or set(request.data) != {"assertion"}:
+        raise AssertionRejected("invalid_request")
+    received_at = database_clock_now()
+    return verify_deauthorization_assertion(
+        request.data["assertion"],
+        project=request.auth.project,
+        purpose=purpose,
+        received_at=received_at,
+    )
+
+
+class ZoomSignedDeauthorizationView(GenericAPIView):
+    authentication_classes = [ApiKeyAuthentication]
+    throttle_classes = [ProjectPostThrottle]
+
+    def post(self, request):
+        _require_enabled()
+        try:
+            assertion = _verified_assertion(request, SETTLE_PURPOSE)
+            result = settle_verified_deauthorization(request.auth.project, assertion)
+        except AssertionRejected as error:
+            return Response({"error": error.code}, status=status.HTTP_401_UNAUTHORIZED)
+        except DeauthorizationServiceError as error:
+            return _signed_error_response(error)
+        if isinstance(result, CommittedDeauthorizationError):
+            return _signed_error_response(result)
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class ZoomSignedDeauthorizationResolveView(GenericAPIView):
+    authentication_classes = [ApiKeyAuthentication]
+    throttle_classes = [ProjectPostThrottle]
+
+    def post(self, request):
+        _require_enabled()
+        try:
+            assertion = _verified_assertion(request, RESOLVE_PURPOSE)
+            result = resolve_verified_deauthorization(request.auth.project, assertion)
+        except AssertionRejected as error:
+            return Response({"error": error.code}, status=status.HTTP_401_UNAUTHORIZED)
+        except DeauthorizationServiceError as error:
+            return _signed_error_response(error)
+        return Response(result, status=status.HTTP_200_OK)
 
 
 class ZoomConnectionRevokeView(GenericAPIView):

@@ -22,4 +22,9 @@ def init_sentry():
         profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.1")),
         environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
         send_default_pii=os.getenv("SENTRY_SEND_PII", "false") == "true",
+        # Trust-boundary request bodies can contain compact assertions, OAuth
+        # codes, or provider tokens. Never attach them, and do not serialize
+        # traceback locals that may hold those same values.
+        max_request_body_size="never",
+        include_local_variables=False,
     )

@@ -372,7 +372,7 @@ class BotController:
             return True
 
     def end_bot_because_zoom_onbehalf_token_unavailable(self, failure_reason):
-        logger.warning(f"Bot {self.bot_in_db.object_id} asked to join on behalf of a Zoom user but no onbehalf token could be obtained ({failure_reason}). Ending the bot instead of joining without it.")
+        logger.warning("zoom_onbehalf_bot_ended code=%s", failure_reason)
         event_metadata = {
             "reason": self.ONBEHALF_TOKEN_UNAVAILABLE_REASON,
             "onbehalf_token_failure_reason": failure_reason,
@@ -395,9 +395,9 @@ class BotController:
                     event_sub_type=BotEventSubTypes.FATAL_ERROR_ATTENDEE_INTERNAL_ERROR,
                     event_metadata=event_metadata,
                 )
-        except Exception as e:
+        except Exception:
             # Never fall through to a join: the bot stays out of the meeting even if the event cannot be recorded.
-            logger.exception(f"Could not record the onbehalf token failure for bot {self.bot_in_db.object_id} in state {BotStates.state_to_api_code(self.bot_in_db.state)}: {e}")
+            logger.error("zoom_onbehalf_bot_failure_record_failed code=state_transition_failed")
 
     def get_zoom_web_bot_adapter(self):
         from bots.zoom_web_bot_adapter import ZoomWebBotAdapter

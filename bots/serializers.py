@@ -43,6 +43,7 @@ from .models import (
     RecordingTranscriptionStates,
     RecordingViews,
     TranscriptionProviders,
+    ZoomOAuthAuthorizationGrant,
     ZoomOAuthConnection,
     ZoomOAuthConnectionStates,
 )
@@ -2277,6 +2278,11 @@ class AsyncTranscriptionSerializer(serializers.ModelSerializer):
 
 class CreateZoomOAuthConnectionSerializer(serializers.Serializer):
     zoom_oauth_app_id = serializers.CharField(help_text="The Zoom Oauth App the connection is for", required=False, default=None)
+    zoom_oauth_app_binding = serializers.UUIDField(
+        help_text="Immutable exact-app binding required by the signed deauthorization flow",
+        required=False,
+        default=None,
+    )
     authorization_code = serializers.CharField(help_text="The authorization code received from Zoom during the OAuth flow")
     redirect_uri = serializers.CharField(help_text="The redirect URI used to obtain the authorization code")
     is_local_recording_token_supported = serializers.BooleanField(help_text="Whether the Zoom OAuth Connection supports generating local recording tokens", required=False, default=True)
@@ -2314,6 +2320,14 @@ class ZoomOAuthConnectionSerializer(serializers.ModelSerializer):
     zoom_oauth_app_id = serializers.CharField(source="zoom_oauth_app.object_id")
     is_local_recording_token_supported = serializers.BooleanField()
     is_onbehalf_token_supported = serializers.BooleanField()
+    zoom_oauth_app_binding = serializers.UUIDField(source="zoom_oauth_app.deauthorization_binding_id", read_only=True)
+    grant_binding_id = serializers.SerializerMethodField()
+    connection_digest = serializers.SerializerMethodField()
+    authorization_generation = serializers.UUIDField(read_only=True)
+    generation_started_at = serializers.SerializerMethodField()
+    grant_sequence = serializers.SerializerMethodField()
+    grant_history_complete = serializers.SerializerMethodField()
+    grant_clock_health_id = serializers.SerializerMethodField()
 
     @extend_schema_field(
         {
@@ -2333,11 +2347,49 @@ class ZoomOAuthConnectionSerializer(serializers.ModelSerializer):
     def get_metadata(self, obj):
         return obj.metadata
 
+    def _grant(self, obj):
+        try:
+            return obj.authorization_grant
+        except ZoomOAuthAuthorizationGrant.DoesNotExist:
+            return None
+
+    def get_grant_binding_id(self, obj):
+        grant = self._grant(obj)
+        return str(grant.binding_id) if grant else None
+
+    def get_connection_digest(self, obj):
+        grant = self._grant(obj)
+        return grant.connection_digest if grant else None
+
+    def get_generation_started_at(self, obj):
+        grant = self._grant(obj)
+        return grant.generation_started_at.isoformat() if grant else None
+
+    def get_grant_sequence(self, obj):
+        grant = self._grant(obj)
+        return grant.grant_sequence if grant else None
+
+    def get_grant_history_complete(self, obj):
+        grant = self._grant(obj)
+        return grant.lineage.history_complete if grant else None
+
+    def get_grant_clock_health_id(self, obj):
+        grant = self._grant(obj)
+        return grant.start_clock_health_id if grant else None
+
     class Meta:
         model = ZoomOAuthConnection
         fields = [
             "id",
             "zoom_oauth_app_id",
+            "zoom_oauth_app_binding",
+            "grant_binding_id",
+            "connection_digest",
+            "authorization_generation",
+            "generation_started_at",
+            "grant_sequence",
+            "grant_history_complete",
+            "grant_clock_health_id",
             "user_id",
             "account_id",
             "state",

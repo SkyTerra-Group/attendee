@@ -17,6 +17,7 @@ import requests
 from django.conf import settings
 from django.core.files.storage import storages
 from django.db import IntegrityError, transaction
+from django.db import connection as database_connection
 from django.db.models import F
 from django.utils import timezone
 
@@ -42,9 +43,16 @@ from bots.models import (
     Utterance,
     WebhookDeliveryAttempt,
     WebhookSubscription,
+    ZoomDeauthorizationAssertionReceipt,
+    ZoomDeauthorizationEventBinding,
+    ZoomDeauthorizationResolutionOutcomes,
+    ZoomDeauthorizationTargetResolution,
+    ZoomOAuthAuthorizationGrant,
     ZoomOAuthConnection,
     ZoomOAuthConnectionStates,
     ZoomRemovalOperation,
+    ZoomRemovalOperationIdentifier,
+    ZoomRemovalOperationIdentifierRoles,
     ZoomRemovalOperationPhases,
     ZoomRemovalOperationSources,
     ZoomRemovalOperationStates,
@@ -108,8 +116,9 @@ def target_digest(project: Project, operation_type: str, target_object_id: str) 
 
 
 def operation_result(operation: ZoomRemovalOperation) -> dict:
+    canonical_id = canonical_operation_id(operation)
     result = {
-        "operation_id": str(operation.operation_id),
+        "operation_id": str(canonical_id),
         "operation_type": operation.operation_type,
         "target_digest": operation.target_digest,
         "state": operation.state,
@@ -119,16 +128,102 @@ def operation_result(operation: ZoomRemovalOperation) -> dict:
         result["failure_code"] = operation.failure_code
     if operation.completed_at:
         result["completed_at"] = operation.completed_at.isoformat()
+    if operation.authorization_grant_id:
+        result.update(
+            {
+                "zoom_oauth_app_binding": str(operation.zoom_oauth_app_binding),
+                "grant_binding_id": str(operation.authorization_grant.binding_id),
+                "connection_digest": operation.connection_digest,
+                "connection_generation": str(operation.authorization_grant.authorization_generation),
+                "generation_started_at": operation.authorization_grant.generation_started_at.isoformat(),
+                "generation_ended_at": (
+                    operation.authorization_grant.generation_ended_at.isoformat()
+                    if operation.authorization_grant.generation_ended_at
+                    else None
+                ),
+                "grant_sequence": operation.authorization_grant.grant_sequence,
+                "grant_history_complete": operation.authorization_grant.lineage.history_complete,
+                "app_digest": operation.app_digest,
+                "terminal_basis": operation.terminal_basis,
+                "evidence": {
+                    "provider_revoke": operation.provider_revoke_settled_at is not None,
+                    "signed_deauthorization": operation.signed_deauthorization_settled_at is not None,
+                },
+            }
+        )
+        binding = operation.deauthorization_event_bindings.order_by("id").first()
+        if binding:
+            snapshot = binding.evidence_snapshot
+            result.update(
+                {
+                    "event_binding_id": str(binding.binding_id),
+                    "event_binding_version": binding.binding_version,
+                    "temporal_policy": binding.temporal_policy,
+                    "temporal_evidence_digest": binding.binding_evidence_digest,
+                    "generation_started_at": snapshot["generation_started_at"],
+                    "generation_ended_at": snapshot["generation_ended_at"],
+                    "grant_sequence": snapshot["lineage_sequence"],
+                    "grant_history_complete": snapshot["history_complete"],
+                }
+            )
     return result
 
 
+def canonical_operation_id(operation: ZoomRemovalOperation) -> uuid.UUID:
+    identifier = operation.identifiers.filter(role=ZoomRemovalOperationIdentifierRoles.CANONICAL).only("identifier_uuid").first()
+    if identifier is None:
+        # Only pre-migration in-memory objects may reach this compatibility
+        # fallback. New operations are not committed without a registry row.
+        return operation.operation_id
+    return identifier.identifier_uuid
+
+
 def get_project_operation(project: Project, operation_id: uuid.UUID) -> ZoomRemovalOperation | None:
-    return ZoomRemovalOperation.objects.filter(project=project, operation_id=operation_id).first()
+    identifier = (
+        ZoomRemovalOperationIdentifier.objects.select_related("operation", "operation__authorization_grant")
+        .filter(project=project, identifier_uuid=operation_id, operation__project=project)
+        .first()
+    )
+    return identifier.operation if identifier else None
 
 
 def delete_expired_receipts() -> int:
-    deleted, _ = ZoomRemovalOperation.objects.filter(state__in=_COMPLETED_STATES, expires_at__lte=timezone.now()).delete()
-    return deleted
+    now = timezone.now()
+    with transaction.atomic():
+        operations = list(
+            ZoomRemovalOperation.objects.select_for_update()
+            .filter(state__in=_COMPLETED_STATES, expires_at__lte=now)
+            .order_by("pk")
+        )
+        if not operations:
+            ZoomDeauthorizationAssertionReceipt.objects.filter(expires_at__lte=now).delete()
+            return 0
+        operation_ids = [operation.pk for operation in operations]
+        grant_ids = [operation.authorization_grant_id for operation in operations if operation.authorization_grant_id]
+        binding_ids = list(
+            ZoomDeauthorizationEventBinding.objects.filter(operation_id__in=operation_ids).values_list("pk", flat=True)
+        )
+        if binding_ids:
+            ZoomDeauthorizationTargetResolution.objects.filter(event_binding_id__in=binding_ids).update(
+                outcome=ZoomDeauthorizationResolutionOutcomes.BOUND_EVENT_RESULT_EXPIRED,
+                authorization_grant=None,
+                operation=None,
+            )
+            ZoomDeauthorizationEventBinding.objects.filter(pk__in=binding_ids).update(
+                authorization_grant=None,
+                operation=None,
+            )
+        ZoomDeauthorizationAssertionReceipt.objects.filter(expires_at__lte=now).delete()
+        ZoomRemovalOperation.objects.filter(pk__in=operation_ids).delete()
+        if grant_ids:
+            ZoomOAuthAuthorizationGrant.objects.filter(
+                pk__in=grant_ids,
+                live_connection__isnull=True,
+                canonical_removal_operation__isnull=True,
+                deauthorization_event_bindings__isnull=True,
+                deauthorization_resolutions__isnull=True,
+            ).delete()
+        return len(operation_ids)
 
 
 def _target_exists_in_other_project(model, project: Project, object_id: str, project_path: str) -> bool:
@@ -143,11 +238,14 @@ def _get_or_create_operation(
     target_object_id: str,
     source: str | None = None,
     target_generation: uuid.UUID | None = None,
+    authorization_grant: ZoomOAuthAuthorizationGrant | None = None,
 ) -> ZoomRemovalOperation:
     digest = target_digest(project, operation_type, target_object_id)
 
     def matches_request(candidate: ZoomRemovalOperation) -> bool:
         if candidate.operation_type != operation_type or candidate.target_digest != digest:
+            return False
+        if authorization_grant is not None and candidate.authorization_grant_id != authorization_grant.pk:
             return False
         if operation_type == ZoomRemovalOperationTypes.REVOKE_CONNECTION and target_generation is not None:
             return candidate.target_generation == target_generation
@@ -158,36 +256,155 @@ def _get_or_create_operation(
         "operation_type": operation_type,
         "target_digest": digest,
     }
-    if operation_type == ZoomRemovalOperationTypes.REVOKE_CONNECTION:
+    if authorization_grant is not None:
+        target_lookup = {
+            "project": project,
+            "operation_type": operation_type,
+            "authorization_grant": authorization_grant,
+        }
+    elif operation_type == ZoomRemovalOperationTypes.REVOKE_CONNECTION:
         target_lookup["target_generation"] = target_generation
 
-    existing = ZoomRemovalOperation.objects.filter(project=project, operation_id=operation_id).first()
+    def create_operation(canonical_id: uuid.UUID) -> ZoomRemovalOperation:
+        operation = ZoomRemovalOperation.objects.create(
+            project=project,
+            operation_id=canonical_id,
+            operation_type=operation_type,
+            source=source,
+            target_digest=digest,
+            target_object_id=target_object_id,
+            target_generation=target_generation,
+            authorization_grant=authorization_grant,
+            zoom_oauth_app_binding=(authorization_grant.zoom_oauth_app.deauthorization_binding_id if authorization_grant else None),
+            connection_digest=(authorization_grant.connection_digest if authorization_grant else None),
+            app_digest=(
+                hashlib.sha256(str(authorization_grant.zoom_oauth_app.deauthorization_binding_id).encode("ascii")).hexdigest()
+                if authorization_grant
+                else None
+            ),
+        )
+        ZoomRemovalOperationIdentifier.objects.create(
+            project=project,
+            identifier_uuid=canonical_id,
+            operation=operation,
+            role=ZoomRemovalOperationIdentifierRoles.CANONICAL,
+            grant_binding_digest=(
+                hashlib.sha256(str(authorization_grant.binding_id).encode("ascii")).hexdigest()
+                if authorization_grant
+                else None
+            ),
+        )
+        if authorization_grant and authorization_grant.canonical_removal_operation_id is None:
+            authorization_grant.canonical_removal_operation = operation
+            authorization_grant.save(update_fields=["canonical_removal_operation", "updated_at"])
+        return operation
+
+    existing = get_project_operation(project, operation_id)
     if existing:
         if not matches_request(existing):
-            raise OperationConflict()
+            # Legacy generic removals remain generation scoped exactly as in
+            # S1: an identifier collision is a non-mutating conflict.  The
+            # fresh server-canonical allocation below is reserved for an
+            # authenticated immutable grant, where the caller must be able to
+            # read its losing grant independently.
+            if authorization_grant is None:
+                raise OperationConflict()
+            # The proposed UUID is already owned by another target. The losing
+            # target still receives one independently readable canonical UUID;
+            # the occupied identifier is never stolen or repointed.
+            server_id = uuid.uuid4()
+            while get_project_operation(project, server_id) is not None:
+                server_id = uuid.uuid4()
+            own_operation = _get_or_create_operation(
+                project=project,
+                operation_id=server_id,
+                operation_type=operation_type,
+                target_object_id=target_object_id,
+                source=source,
+                target_generation=target_generation,
+                authorization_grant=authorization_grant,
+            )
+            raise OperationConflict(canonical_operation_id(own_operation))
         return existing
 
     existing_target = ZoomRemovalOperation.objects.filter(**target_lookup).first()
     if existing_target:
-        raise OperationConflict(existing_target.operation_id)
+        _claim_alternate_identifier(existing_target, operation_id)
+        raise OperationConflict(canonical_operation_id(existing_target))
 
     try:
         with transaction.atomic():
-            return ZoomRemovalOperation.objects.create(
-                project=project,
-                operation_id=operation_id,
-                operation_type=operation_type,
-                source=source,
-                target_digest=digest,
-                target_object_id=target_object_id,
-                target_generation=target_generation,
-            )
+            _lock_identifier(project.pk, operation_id)
+            occupied = get_project_operation(project, operation_id)
+            if occupied is not None:
+                if matches_request(occupied):
+                    return occupied
+                # This can happen only when another claimant won after the
+                # unlocked preflight. Let the definitive unique registry roll
+                # this savepoint back; the recovery below allocates our own ID.
+                raise IntegrityError("operation identifier occupied")
+            return create_operation(operation_id)
     except IntegrityError:
-        existing = ZoomRemovalOperation.objects.filter(project=project, operation_id=operation_id).first()
+        existing_target = ZoomRemovalOperation.objects.filter(**target_lookup).first()
+        if existing_target is not None:
+            try:
+                _claim_alternate_identifier(existing_target, operation_id)
+            except OperationConflict:
+                pass
+            raise OperationConflict(canonical_operation_id(existing_target))
+        existing = get_project_operation(project, operation_id)
         if existing and matches_request(existing):
             return existing
-        existing_target = ZoomRemovalOperation.objects.filter(**target_lookup).first()
-        raise OperationConflict(existing_target.operation_id if existing_target else None)
+        if existing is not None:
+            if authorization_grant is None:
+                raise OperationConflict()
+            server_id = uuid.uuid4()
+            while get_project_operation(project, server_id) is not None:
+                server_id = uuid.uuid4()
+            own_operation = _get_or_create_operation(
+                project=project,
+                operation_id=server_id,
+                operation_type=operation_type,
+                target_object_id=target_object_id,
+                source=source,
+                target_generation=target_generation,
+                authorization_grant=authorization_grant,
+            )
+            raise OperationConflict(canonical_operation_id(own_operation))
+        raise
+
+
+def _lock_identifier(project_id: int, identifier: uuid.UUID) -> None:
+    if database_connection.vendor != "postgresql":
+        return
+    material = hashlib.sha256(f"zoom-operation-id:{project_id}:{identifier}".encode("ascii")).digest()
+    signed_key = int.from_bytes(material[:8], "big", signed=True)
+    with database_connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", [signed_key])
+
+
+def _claim_alternate_identifier(operation: ZoomRemovalOperation, identifier: uuid.UUID) -> None:
+    with transaction.atomic():
+        _lock_identifier(operation.project_id, identifier)
+        existing = ZoomRemovalOperationIdentifier.objects.select_for_update().filter(
+            project=operation.project,
+            identifier_uuid=identifier,
+        ).first()
+        if existing:
+            if existing.operation_id != operation.pk:
+                raise OperationConflict(canonical_operation_id(operation))
+            return
+        ZoomRemovalOperationIdentifier.objects.create(
+            project=operation.project,
+            identifier_uuid=identifier,
+            operation=operation,
+            role=ZoomRemovalOperationIdentifierRoles.ALTERNATE,
+            grant_binding_digest=(
+                hashlib.sha256(str(operation.authorization_grant.binding_id).encode("ascii")).hexdigest()
+                if operation.authorization_grant_id
+                else None
+            ),
+        )
 
 
 def _claim_operation(operation: ZoomRemovalOperation) -> tuple[ZoomRemovalOperation, uuid.UUID | None]:
@@ -381,10 +598,16 @@ def process_connection_revoke(
     if _target_exists_in_other_project(ZoomOAuthConnection, project, connection_object_id, "zoom_oauth_app__project"):
         raise CrossProjectTarget()
 
-    initial_connection = ZoomOAuthConnection.objects.filter(
+    initial_connection = ZoomOAuthConnection.objects.select_related("zoom_oauth_app").filter(
         object_id=connection_object_id,
         zoom_oauth_app__project=project,
     ).first()
+    authorization_grant = None
+    if initial_connection is not None:
+        try:
+            authorization_grant = initial_connection.authorization_grant
+        except ZoomOAuthAuthorizationGrant.DoesNotExist:
+            authorization_grant = None
 
     operation = _get_or_create_operation(
         project=project,
@@ -393,6 +616,7 @@ def process_connection_revoke(
         target_object_id=connection_object_id,
         source=source,
         target_generation=initial_connection.authorization_generation if initial_connection else None,
+        authorization_grant=authorization_grant,
     )
     operation, lease_token = _claim_operation(operation)
     if lease_token is None:
@@ -461,6 +685,12 @@ def process_connection_revoke(
             claimed.lease_expires_at = None
             claimed.completed_at = now
             claimed.expires_at = now + timedelta(days=RECEIPT_RETENTION_DAYS)
+            claimed.provider_revoke_settled_at = claimed.provider_revoke_settled_at or now
+            claimed.terminal_basis = (
+                "provider_and_signed"
+                if claimed.signed_deauthorization_settled_at
+                else "provider_revoke"
+            )
             claimed.save()
             return claimed
     except LeaseLost:

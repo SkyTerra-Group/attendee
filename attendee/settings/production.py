@@ -1,7 +1,7 @@
 import os
 
 from .base import *
-from .base import LOG_FORMATTERS, LOG_HANDLER_NAMES, LOG_HANDLERS
+from .base import LOG_FILTERS, LOG_FORMATTERS, LOG_HANDLER_NAMES, LOG_HANDLERS
 from .db import default_database
 
 DEBUG = False
@@ -58,6 +58,7 @@ CSRF_TRUSTED_ORIGINS = os.getenv("CSRF_TRUSTED_ORIGINS").split(",") if os.getenv
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": LOG_FILTERS,
     "formatters": LOG_FORMATTERS,
     "handlers": LOG_HANDLERS,
     "root": {

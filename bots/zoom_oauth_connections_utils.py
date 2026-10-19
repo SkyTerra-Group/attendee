@@ -75,8 +75,8 @@ def client_id_and_secret_is_valid(client_id: str, client_secret: str) -> bool:
             return True
 
         return False
-    except Exception as e:
-        logger.exception(f"Error validating Zoom OAuth client_id and client_secret: {e}")
+    except Exception:
+        logger.error("zoom_oauth_credentials_validation_failed code=transport_or_parse_error")
         return False
 
 
@@ -84,7 +84,7 @@ def _verify_zoom_webhook_signature(body: str, timestamp: str, signature: str, se
     """Verify the Zoom webhook signature."""
     hmac_hash = hmac.new(secret.encode("utf-8"), f"v0:{timestamp}:{body}".encode("utf-8"), hashlib.sha256).hexdigest()
     expected_signature = f"v0={hmac_hash}"
-    return expected_signature == signature
+    return hmac.compare_digest(expected_signature, signature or "")
 
 
 def compute_zoom_webhook_validation_response(plain_token: str, secret_token: str) -> dict:
@@ -113,9 +113,13 @@ def compute_zoom_webhook_validation_response(plain_token: str, secret_token: str
 
 
 def _raise_if_error_is_authentication_error(e: requests.RequestException):
-    error_code = e.response.json().get("error")
+    try:
+        payload = e.response.json() if e.response is not None else {}
+    except (TypeError, ValueError):
+        payload = {}
+    error_code = payload.get("error") if isinstance(payload, dict) else None
     if error_code == "invalid_grant" or error_code == "invalid_client":
-        raise ZoomAPIAuthenticationError(f"Zoom Authentication error: {e.response.json()}")
+        raise ZoomAPIAuthenticationError("zoom_authentication_rejected")
 
     return
 
@@ -151,7 +155,9 @@ def _get_access_token(zoom_oauth_connection) -> str:
 
         access_token = token_data.get("access_token")
         if not access_token:
-            raise ZoomAPIError(f"No access_token in refresh response. Response body: {response.json()}")
+            # Fixed text only: preserve the established caller contract while
+            # never embedding the provider body in the exception or logs.
+            raise ZoomAPIError("No access_token in refresh response")
 
         # IMPORTANT: Zoom rotates refresh tokens. Save the new one if provided.
         new_refresh = token_data.get("refresh_token")
@@ -161,14 +167,14 @@ def _get_access_token(zoom_oauth_connection) -> str:
                 current_credentials = current.get_credentials() or {}
                 current_credentials["refresh_token"] = new_refresh
                 current.set_credentials(current_credentials)
-            logger.info("Stored rotated Zoom refresh_token for zoom oauth connection %s", zoom_oauth_connection.object_id)
+            logger.info("zoom_oauth_refresh_rotated")
 
         _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         return access_token
 
-    except requests.RequestException as e:
-        _raise_if_error_is_authentication_error(e)
-        raise ZoomAPIError(f"Failed to refresh Zoom access token. Response body: {e.response.json()}")
+    except requests.RequestException as error:
+        _raise_if_error_is_authentication_error(error)
+        raise ZoomAPIError("zoom_refresh_failed") from None
 
 
 def _make_zoom_api_request(url: str, access_token: str, params: dict) -> dict:
@@ -181,10 +187,10 @@ def _make_zoom_api_request(url: str, access_token: str, params: dict) -> dict:
             resp = s.send(req, timeout=25)
         resp.raise_for_status()
         return resp.json()
-    except requests.RequestException as e:
-        _raise_if_error_is_authentication_error(e)
-        logger.exception(f"Failed to make Zoom API request. Response body: {e.response.json()}")
-        raise e
+    except requests.RequestException as error:
+        _raise_if_error_is_authentication_error(error)
+        logger.error("zoom_api_request_failed code=provider_request_failed")
+        raise ZoomAPIError("zoom_api_request_failed") from None
 
 
 def _get_zoom_personal_meeting_id(access_token: str) -> str:
@@ -220,7 +226,7 @@ def _get_zoom_meetings(access_token: str) -> list[dict]:
         if next_page_token:
             params["next_page_token"] = next_page_token
 
-        logger.info(f"Fetching Zoom meetings: {base_url} with params: {params}")
+        logger.info("zoom_meeting_sync_page_requested")
         response_data = _make_zoom_api_request(base_url, access_token, params)
 
         meetings = response_data.get("meetings", [])
@@ -244,7 +250,7 @@ def _upsert_zoom_meeting_to_zoom_oauth_connection_mapping(zoom_meeting_ids: list
         # linearizes either before this block (and rejects it) or after it.
         for zoom_meeting_id in zoom_meeting_ids:
             if not zoom_meeting_id:
-                logger.warning(f"Zoom meeting id is None for zoom oauth connection {zoom_oauth_connection.id}")
+                logger.warning("zoom_meeting_mapping_skipped code=missing_meeting_id")
                 continue
 
             zoom_meeting_to_zoom_oauth_connection_mapping, created = ZoomMeetingToZoomOAuthConnectionMapping.objects.update_or_create(
@@ -259,7 +265,11 @@ def _upsert_zoom_meeting_to_zoom_oauth_connection_mapping(zoom_meeting_ids: list
             if created:
                 num_created += 1
 
-    logger.info(f"Upserted {num_updated} zoom meeting ids to zoom oauth connection mappings and created {num_created} new ones for zoom oauth connection {zoom_oauth_connection.id}")
+    logger.info(
+        "zoom_meeting_mapping_upserted updated_count=%s created_count=%s",
+        num_updated,
+        num_created,
+    )
 
 
 def _handle_zoom_api_authentication_error(zoom_oauth_connection: ZoomOAuthConnection, e: ZoomAPIAuthenticationError):
@@ -267,10 +277,13 @@ def _handle_zoom_api_authentication_error(zoom_oauth_connection: ZoomOAuthConnec
         with transaction.atomic():
             current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
             if current.state == ZoomOAuthConnectionStates.DISCONNECTED:
-                logger.info(f"Zoom OAuth connection {zoom_oauth_connection.id} is already in state DISCONNECTED, skipping authentication error handling")
+                logger.info("zoom_oauth_auth_failure_ignored code=already_disconnected")
                 return
             current.state = ZoomOAuthConnectionStates.DISCONNECTED
             current.connection_failure_data = {
+                # This is persisted connection state, not a log field. Keep
+                # the established bounded authentication reason for API/webhook
+                # consumers; logging below remains a fixed safe code.
                 "error": str(e),
                 "timestamp": timezone.now().isoformat(),
             }
@@ -278,7 +291,7 @@ def _handle_zoom_api_authentication_error(zoom_oauth_connection: ZoomOAuthConnec
     except ZoomOAuthConnectionRemovalFenced:
         return
 
-    logger.exception(f"Zoom OAuth connection sync failed with ZoomAPIAuthenticationError for {zoom_oauth_connection.id}: {e}")
+    logger.error("zoom_oauth_connection_sync_failed code=authentication_error")
 
     # Create webhook event
     trigger_webhook(
@@ -297,19 +310,19 @@ def get_local_recording_token_via_zoom_oauth_app(bot: Bot) -> str | None:
 
     meeting_id, password = parse_zoom_join_url(meeting_url)
     if not meeting_id:
-        logger.info(f"No meeting id found in join url {meeting_url}")
+        logger.info("zoom_local_recording_token_unavailable code=meeting_id_missing")
         return None
 
     mapping_for_meeting_id = ZoomMeetingToZoomOAuthConnectionMapping.objects.filter(zoom_oauth_app=zoom_oauth_app, meeting_id=str(meeting_id)).first()
 
     if not mapping_for_meeting_id:
-        logger.info(f"No mapping found for meeting id {meeting_id} in zoom oauth app {zoom_oauth_app.id}")
+        logger.info("zoom_local_recording_token_unavailable code=mapping_missing")
         return None
 
     zoom_oauth_connection = mapping_for_meeting_id.zoom_oauth_connection
 
     if not zoom_oauth_connection.is_local_recording_token_supported:
-        logger.info(f"Zoom oauth connection {zoom_oauth_connection.object_id} does not support local recording tokens, skipping")
+        logger.info("zoom_local_recording_token_unavailable code=capability_disabled")
         return None
 
     try:
@@ -318,13 +331,13 @@ def get_local_recording_token_via_zoom_oauth_app(bot: Bot) -> str | None:
         local_recording_token = _get_local_recording_token(meeting_id, access_token)
         return local_recording_token
 
-    except ZoomAPIAuthenticationError as e:
-        _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
-        logger.exception(f"Failed to get local recording token via zoom oauth app for {meeting_url}: {e}. This was considered an authentication error.")
+    except ZoomAPIAuthenticationError as error:
+        _handle_zoom_api_authentication_error(zoom_oauth_connection, error)
+        logger.error("zoom_local_recording_token_failed code=authentication_error")
         return None
 
-    except Exception as e:
-        logger.exception(f"Failed to get local recording token via zoom oauth app for {meeting_url}: {e}")
+    except Exception:
+        logger.error("zoom_local_recording_token_failed code=provider_or_internal_error")
         return None
 
 
@@ -374,14 +387,14 @@ def _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot: Bot) -> tuple
         return None, ONBEHALF_TOKEN_FAILURE_CONNECTION_NOT_FOUND
 
     if not zoom_oauth_connection.is_onbehalf_token_supported:
-        logger.info(f"Zoom oauth connection {zoom_oauth_connection.object_id} does not support onbehalf tokens, skipping")
+        logger.info("zoom_onbehalf_token_unavailable code=capability_disabled")
         return None, ONBEHALF_TOKEN_FAILURE_CONNECTION_DOES_NOT_SUPPORT_ONBEHALF_TOKENS
 
     meeting_url = bot.meeting_url
 
     meeting_id, password = parse_zoom_join_url(meeting_url)
     if not meeting_id:
-        logger.info(f"No meeting id found in join url {meeting_url}")
+        logger.info("zoom_onbehalf_token_unavailable code=meeting_id_missing")
         return None, ONBEHALF_TOKEN_FAILURE_NO_MEETING_ID
 
     try:
@@ -392,13 +405,13 @@ def _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot: Bot) -> tuple
             return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_RETURNED_NO_TOKEN
         return onbehalf_token, None
 
-    except ZoomAPIAuthenticationError as e:
-        _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
-        logger.exception(f"Failed to get onbehalf token via zoom oauth app with user id {user_id_for_onbehalf_token}: {e}. This was considered an authentication error.")
+    except ZoomAPIAuthenticationError as error:
+        _handle_zoom_api_authentication_error(zoom_oauth_connection, error)
+        logger.error("zoom_onbehalf_token_failed code=authentication_error")
         return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_AUTHENTICATION_ERROR
 
-    except Exception as e:
-        logger.exception(f"Failed to get onbehalf token via zoom oauth app with user id {user_id_for_onbehalf_token}: {e}")
+    except Exception:
+        logger.error("zoom_onbehalf_token_failed code=provider_or_internal_error")
         return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_ERROR
 
 

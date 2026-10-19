@@ -1,6 +1,7 @@
 import os
 
 from .base import *
+from .base import LOG_FILTERS
 
 DEBUG = True
 SITE_DOMAIN = "localhost:8000"
@@ -21,9 +22,11 @@ DATABASES = {
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+    "filters": LOG_FILTERS,
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
+            "filters": ["zoom_trust_boundary_redaction"],
         },
     },
     "root": {

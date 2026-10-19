@@ -55,6 +55,15 @@ CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
 # retention flow has passed its integrated staging and wording gates.
 ENABLE_ZOOM_RETENTION_REMOVAL_API = os.getenv("ENABLE_ZOOM_RETENTION_REMOVAL_API", "false").lower() == "true"
 
+# Purpose-bound signed deauthorization trust.  The registry contains public
+# keys and exact project/app/issuer/audience bindings only.  The audit key is a
+# separate secret used solely for non-readable identity lineage digests.
+ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON = os.getenv("ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON", "{}")
+ZOOM_REMOVAL_AUDIT_KEY = os.getenv("ZOOM_REMOVAL_AUDIT_KEY")
+ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID = os.getenv("ZOOM_DEAUTH_DB_CLOCK_HEALTH_ID", "")
+ZOOM_DEAUTH_DB_CLOCK_ERROR_MS = int(os.getenv("ZOOM_DEAUTH_DB_CLOCK_ERROR_MS", "1001"))
+ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS = os.getenv("ZOOM_DEAUTH_DB_CLOCK_CONTINUOUS", "false").lower() == "true"
+
 AUTH_USER_MODEL = "accounts.User"
 
 AUTHENTICATION_BACKENDS = [
@@ -254,6 +263,12 @@ LOG_FORMATTERS = {
     "json": {"class": "attendee.logging.ISOJsonFormatter", "format": "%(timestamp)s %(name)s %(levelname)s %(message)s"},
 }
 
+LOG_FILTERS = {
+    "zoom_trust_boundary_redaction": {
+        "()": "attendee.logging.ZoomTrustBoundaryRedactionFilter",
+    },
+}
+
 # When enabled on a bot pod, the pod's application logs are also written to a size capped file
 # which is attached to the bot's last event as a debug artifact when the bot cleans up.
 SAVE_BOT_LOGS_TO_DASHBOARD = os.getenv("SAVE_BOT_LOGS_TO_DASHBOARD", "false") == "true"
@@ -266,6 +281,7 @@ LOG_HANDLERS = {
         "class": "logging.StreamHandler",
         "stream": sys.stdout,
         "formatter": os.getenv("ATTENDEE_LOG_FORMAT"),  # `None` (default formatter) is the default
+        "filters": ["zoom_trust_boundary_redaction"],
     },
 }
 
@@ -277,6 +293,7 @@ if IS_A_BOT_POD and SAVE_BOT_LOGS_TO_DASHBOARD:
         "maxBytes": BOT_POD_LOG_FILE_MAX_BYTES // 2,
         "backupCount": 1,
         "formatter": os.getenv("ATTENDEE_LOG_FORMAT"),  # `None` (default formatter) is the default
+        "filters": ["zoom_trust_boundary_redaction"],
     }
 
 # The handlers every logger writes to.

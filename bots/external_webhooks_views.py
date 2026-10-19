@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -120,21 +122,27 @@ class ExternalWebhookZoomOAuthAppView(View):
     """
 
     def post(self, request, object_id):
-        request_body = request.body.decode("utf-8")
         signature_header = request.META.get("HTTP_X_ZM_SIGNATURE")
         timestamp_header = request.META.get("HTTP_X_ZM_REQUEST_TIMESTAMP")
 
-        logger.info(f"Received Zoom OAuth app webhook event: {request_body}")
-
         try:
+            request_body = request.body.decode("utf-8")
             zoom_oauth_app = ZoomOAuthApp.objects.get(object_id=object_id)
+            correlation = hmac.new(
+                zoom_oauth_app.webhook_secret.encode("utf-8"),
+                request.body,
+                hashlib.sha256,
+            ).hexdigest()[:8]
             if not _verify_zoom_webhook_signature(
                 body=request_body,
                 timestamp=timestamp_header,
                 signature=signature_header,
                 secret=zoom_oauth_app.webhook_secret,
             ):
-                logger.error(f"Invalid Zoom webhook signature for webhook for zoom oauth app {zoom_oauth_app.object_id}")
+                logger.error(
+                    "zoom_external_webhook_rejected code=invalid_signature correlation=%s",
+                    correlation,
+                )
                 # Only update if it was more than 5 minutes ago to prevent excessive updates
                 if not zoom_oauth_app.last_unverified_webhook_received_at or zoom_oauth_app.last_unverified_webhook_received_at < timezone.now() - timedelta(minutes=5):
                     zoom_oauth_app.last_unverified_webhook_received_at = timezone.now()
@@ -143,6 +151,12 @@ class ExternalWebhookZoomOAuthAppView(View):
 
             event_json = json.loads(request_body)
             event_type = event_json.get("event")
+            safe_event_type = event_type if event_type in {"meeting.created", "user.updated", "endpoint.url_validation"} else "other"
+            logger.info(
+                "zoom_external_webhook_verified event_type=%s correlation=%s",
+                safe_event_type,
+                correlation,
+            )
             if event_type == "meeting.created":
                 meeting_id = event_json.get("payload", {}).get("object", {}).get("id")
                 # Host is the user who is hosting the meeting
@@ -151,11 +165,11 @@ class ExternalWebhookZoomOAuthAppView(View):
                 operator_id = event_json.get("payload", {}).get("operator_id")
                 # Just logging this to see if it ever happens
                 if operator_id != host_id:
-                    logger.info(f"Operator ID does not match Host ID. {operator_id} != {host_id}. This doesn't affect anything, but just logging it.")
+                    logger.info("zoom_external_webhook_notice code=operator_host_mismatch")
 
                 zoom_oauth_connection = ZoomOAuthConnection.objects.filter(zoom_oauth_app=zoom_oauth_app, user_id=operator_id).first()
                 if not zoom_oauth_connection:
-                    logger.info(f"No Zoom OAuth connection found for operator ID {operator_id}")
+                    logger.info("zoom_external_webhook_ignored code=connection_not_found")
                     return HttpResponse(status=200)
 
                 _upsert_zoom_meeting_to_zoom_oauth_connection_mapping([str(meeting_id)], zoom_oauth_connection)
@@ -164,20 +178,20 @@ class ExternalWebhookZoomOAuthAppView(View):
                 new_object = event_json.get("payload", {}).get("object")
                 old_object = event_json.get("payload", {}).get("old_object")
                 if new_object.get("pmi") == old_object.get("pmi"):
-                    logger.info(f"PMID did not change. {new_object.get('pmi')} == {old_object.get('pmi')}. So not doing anything.")
+                    logger.info("zoom_external_webhook_ignored code=pmi_unchanged")
                     return HttpResponse(status=200)
 
                 if new_object.get("pmi") is None:
-                    logger.info("New PMI is None. So not doing anything.")
+                    logger.info("zoom_external_webhook_ignored code=pmi_missing")
                     return HttpResponse(status=200)
 
                 if new_object.get("id") is None:
-                    logger.info("New user ID is None. So not doing anything.")
+                    logger.info("zoom_external_webhook_ignored code=user_id_missing")
                     return HttpResponse(status=200)
 
                 zoom_oauth_connection = ZoomOAuthConnection.objects.filter(zoom_oauth_app=zoom_oauth_app, user_id=new_object.get("id")).first()
                 if not zoom_oauth_connection:
-                    logger.info(f"No Zoom OAuth connection found for user ID {new_object.get('id')}")
+                    logger.info("zoom_external_webhook_ignored code=connection_not_found")
                     return HttpResponse(status=200)
 
                 _upsert_zoom_meeting_to_zoom_oauth_connection_mapping([str(new_object.get("pmi"))], zoom_oauth_connection)
@@ -190,14 +204,17 @@ class ExternalWebhookZoomOAuthAppView(View):
             # Handle endpoint.url_validation event type
             if event_type == "endpoint.url_validation":
                 json_response = compute_zoom_webhook_validation_response(event_json.get("payload", {}).get("plainToken"), zoom_oauth_app.webhook_secret)
-                logger.info(f"Received Zoom OAuth app webhook event for endpoint URL validation: {event_json}. Returning JSON response: {json_response}")
+                logger.info(
+                    "zoom_external_webhook_validation_completed correlation=%s",
+                    correlation,
+                )
                 return JsonResponse(json_response, status=200)
 
         except ZoomOAuthApp.DoesNotExist:
-            logger.error("Zoom OAuth app does not exist")
+            logger.error("zoom_external_webhook_rejected code=app_not_found")
             return HttpResponse(status=400)
-        except Exception as e:
-            logger.exception(f"Error processing Zoom OAuth app webhook: {e}")
+        except Exception:
+            logger.error("zoom_external_webhook_rejected code=processing_error")
             return HttpResponse(status=400)
         return HttpResponse(status=200)
 

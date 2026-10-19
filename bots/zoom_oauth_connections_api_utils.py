@@ -7,6 +7,7 @@ from django.db import IntegrityError, transaction
 
 from .models import ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
 from .serializers import CreateZoomOAuthConnectionSerializer
+from .zoom_deauthorization_grants import GrantCaptureUnavailable, capture_authorization_grant
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +56,19 @@ def create_zoom_oauth_connection(data, project):
     # Validate that the Zoom OAuth App exists in the project
     zoom_oauth_app = None
     try:
-        if validated_data["zoom_oauth_app_id"]:
+        if validated_data["zoom_oauth_app_binding"]:
+            zoom_oauth_app = ZoomOAuthApp.objects.get(
+                deauthorization_binding_id=validated_data["zoom_oauth_app_binding"],
+                project=project,
+            )
+            if validated_data["zoom_oauth_app_id"] and validated_data["zoom_oauth_app_id"] != zoom_oauth_app.object_id:
+                return None, {"error": "Zoom OAuth App scope mismatch."}
+        elif validated_data["zoom_oauth_app_id"]:
             zoom_oauth_app = ZoomOAuthApp.objects.get(object_id=validated_data["zoom_oauth_app_id"], project=project)
         else:
             zoom_oauth_app = ZoomOAuthApp.objects.get(project=project)
     except ZoomOAuthApp.DoesNotExist:
-        if validated_data["zoom_oauth_app_id"]:
-            return None, {"error": f"Zoom OAuth App with id {validated_data['zoom_oauth_app_id']} does not exist in this project ({project.name})."}
-        else:
-            return None, {"error": f"No Zoom OAuth App found in this project ({project.name}). Please add a Zoom OAuth App first."}
+        return None, {"error": "Zoom OAuth App was not found in the authenticated project."}
 
     # Exchange the access code for tokens
     zoom_oauth_tokens = None
@@ -74,8 +79,8 @@ def create_zoom_oauth_connection(data, project):
             client_id=zoom_oauth_app.client_id,
             client_secret=zoom_oauth_app.client_secret,
         )
-    except Exception as e:
-        logger.error(f"Error exchanging access code for tokens: {e}")
+    except Exception:
+        logger.error("zoom_oauth_authorization_failed code=token_exchange_failed")
         return None, {"error": "Error exchanging access code for tokens. Please check that the authorization code and redirect URI are correct."}
 
     # Validate that the tokens have the required scopes
@@ -98,8 +103,8 @@ def create_zoom_oauth_connection(data, project):
     user_info = None
     try:
         user_info = _get_user_info(zoom_oauth_tokens["access_token"])
-    except Exception as e:
-        logger.error(f"Error getting user info: {e}")
+    except Exception:
+        logger.error("zoom_oauth_authorization_failed code=user_info_failed")
         return None, {"error": "Error getting user info. Please check that the access token is valid."}
 
     # Validate that the user is active
@@ -108,6 +113,13 @@ def create_zoom_oauth_connection(data, project):
 
     try:
         with transaction.atomic():
+            # Shared signed-deauthorization lock order begins with the exact
+            # app before any connection/lineage row. This prevents a callback
+            # from holding the connection while settlement holds the app.
+            zoom_oauth_app = ZoomOAuthApp.objects.select_for_update().get(
+                pk=zoom_oauth_app.pk,
+                project=project,
+            )
             zoom_oauth_connection = ZoomOAuthConnection.objects.select_for_update().filter(zoom_oauth_app=zoom_oauth_app, user_id=user_info["id"]).first()
             created = zoom_oauth_connection is None
             if created:
@@ -137,13 +149,21 @@ def create_zoom_oauth_connection(data, project):
                 # ambiguous removal cannot delete or rewrite it.
                 zoom_oauth_connection.replace_authorization_credentials(credentials)
 
+            # Exact-app callers participate in the permanent grant lineage.
+            # Legacy callers remain compatible but cannot later gain time-only
+            # signed-event authority from incomplete history.
+            if validated_data["zoom_oauth_app_binding"]:
+                capture_authorization_grant(zoom_oauth_connection)
+
             return zoom_oauth_connection, None
 
-    except IntegrityError as e:
+    except GrantCaptureUnavailable:
+        return None, {"error": "Zoom authorization lineage could not be recorded safely."}
+    except IntegrityError:
         error_id = str(uuid.uuid4())
-        logger.error(f"Error creating zoom oauth connection (error_id={error_id}): {e}")
+        logger.error("zoom_oauth_authorization_failed code=database_conflict error_id=%s", error_id)
         return None, {"non_field_errors": ["An error occurred while creating the zoom oauth connection. Error ID: " + error_id]}
-    except Exception as e:
+    except Exception:
         error_id = str(uuid.uuid4())
-        logger.error(f"Error creating zoom oauth connection (error_id={error_id}): {e}")
+        logger.error("zoom_oauth_authorization_failed code=internal_error error_id=%s", error_id)
         return None, {"non_field_errors": ["An unexpected error occurred while creating the zoom oauth connection. Error ID: " + error_id]}

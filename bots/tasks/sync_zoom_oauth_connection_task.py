@@ -24,7 +24,7 @@ from celery import shared_task
 def enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConnection):
     """Enqueue a sync zoom oauth connection task for a zoom oauth connection."""
     if not zoom_oauth_connection.is_local_recording_token_supported:
-        logger.info(f"Skipping sync zoom oauth connection task for {zoom_oauth_connection.id} because it does not support local recording tokens")
+        logger.info("zoom_oauth_sync_skipped code=capability_disabled")
         return
 
     with transaction.atomic():
@@ -42,7 +42,7 @@ def enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConn
 )
 def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
     """Celery task to sync zoom meetings with a zoom oauth connection."""
-    logger.info(f"Syncing zoom oauth connection {zoom_oauth_connection_id}")
+    logger.info("zoom_oauth_sync_started")
     zoom_oauth_connection = ZoomOAuthConnection.objects.get(id=zoom_oauth_connection_id)
 
     try:
@@ -53,7 +53,7 @@ def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
         _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         zoom_meetings = _get_zoom_meetings(access_token)
 
-        logger.info(f"Fetched {len(zoom_meetings)} meetings from Zoom for zoom oauth connection {zoom_oauth_connection_id}")
+        logger.info("zoom_oauth_sync_provider_result meeting_count=%s", len(zoom_meetings))
 
         _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         zoom_personal_meeting_id = _get_zoom_personal_meeting_id(access_token)
@@ -78,8 +78,8 @@ def sync_zoom_oauth_connection(self, zoom_oauth_connection_id):
     except ZoomAPIAuthenticationError as e:
         _handle_zoom_api_authentication_error(zoom_oauth_connection, e)
 
-    except Exception as e:
-        logger.exception(f"Zoom OAuth connection sync failed with {type(e).__name__} for {zoom_oauth_connection_id}: {e}")
+    except Exception:
+        logger.error("zoom_oauth_sync_failed code=provider_or_internal_error")
         try:
             update_zoom_oauth_connection_if_writable(zoom_oauth_connection, last_attempted_sync_at=timezone.now())
         except ZoomOAuthConnectionRemovalFenced:
