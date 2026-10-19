@@ -434,9 +434,9 @@ def _claim_alternate_identifier(operation: ZoomRemovalOperation, identifier: uui
 
 
 def _claim_operation(operation: ZoomRemovalOperation) -> tuple[ZoomRemovalOperation, uuid.UUID | None]:
-    now = timezone.now()
     with transaction.atomic():
         current = ZoomRemovalOperation.objects.select_for_update().get(pk=operation.pk)
+        now = timezone.now()
         if current.state in _COMPLETED_STATES:
             return current, None
         if current.lease_token and current.lease_expires_at and current.lease_expires_at > now:
@@ -451,39 +451,59 @@ def _claim_operation(operation: ZoomRemovalOperation) -> tuple[ZoomRemovalOperat
         return current, lease_token
 
 
+def _require_unexpired(deadline):
+    now = timezone.now()
+    if deadline is None or deadline <= now:
+        raise LeaseLost()
+    return now
+
+
+def _require_live_claim(operation: ZoomRemovalOperation, lease_token: uuid.UUID):
+    """Check after acquiring row locks; a matching but expired token is lost."""
+    if not lease_token or operation.lease_token != lease_token:
+        raise LeaseLost()
+    return _require_unexpired(operation.lease_expires_at)
+
+
 def _update_claimed(operation_id: int, lease_token: uuid.UUID, **values) -> ZoomRemovalOperation:
     with transaction.atomic():
         operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
-        if operation.lease_token != lease_token:
-            raise LeaseLost()
+        now = _require_live_claim(operation, lease_token)
+        deadline = operation.lease_expires_at
         for field, value in values.items():
             setattr(operation, field, value)
-        operation.lease_expires_at = timezone.now() + timedelta(seconds=LEASE_SECONDS)
+        operation.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
         update_fields = [*values.keys(), "lease_expires_at", "updated_at"]
         operation.save(update_fields=update_fields)
+        _require_unexpired(deadline)
         return operation
 
 
 def _release_claim(operation_id: int, lease_token: uuid.UUID, *, state: str | None = None, failure_code: str | None = None) -> ZoomRemovalOperation:
-    with transaction.atomic():
-        operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
-        if operation.lease_token != lease_token:
+    try:
+        with transaction.atomic():
+            operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
+            _require_live_claim(operation, lease_token)
+            deadline = operation.lease_expires_at
+            if state is not None:
+                operation.state = state
+            operation.failure_code = failure_code
+            operation.lease_token = None
+            operation.lease_expires_at = None
+            operation.save(update_fields=["state", "failure_code", "lease_token", "lease_expires_at", "updated_at"])
+            _require_unexpired(deadline)
             return operation
-        if state is not None:
-            operation.state = state
-        operation.failure_code = failure_code
-        operation.lease_token = None
-        operation.lease_expires_at = None
-        operation.save(update_fields=["state", "failure_code", "lease_token", "lease_expires_at", "updated_at"])
-        return operation
+    except LeaseLost:
+        # A release is also used by failure handlers. Preserve its no-op
+        # readback semantics even if expiry occurs during the status write.
+        return ZoomRemovalOperation.objects.get(pk=operation_id)
 
 
 def _complete_claim(operation_id: int, lease_token: uuid.UUID, state: str) -> ZoomRemovalOperation:
-    now = timezone.now()
     with transaction.atomic():
         operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
-        if operation.lease_token != lease_token:
-            raise LeaseLost()
+        now = _require_live_claim(operation, lease_token)
+        deadline = operation.lease_expires_at
         operation.state = state
         operation.phase = ZoomRemovalOperationPhases.COMPLETE
         operation.failure_code = None
@@ -507,6 +527,7 @@ def _complete_claim(operation_id: int, lease_token: uuid.UUID, state: str) -> Zo
                 "updated_at",
             ]
         )
+        _require_unexpired(deadline)
         return operation
 
 
@@ -655,9 +676,9 @@ def process_connection_revoke(
     try:
         with transaction.atomic():
             claimed = ZoomRemovalOperation.objects.select_for_update().get(pk=operation.pk)
-            if claimed.lease_token != lease_token:
-                raise LeaseLost()
+            _require_live_claim(claimed, lease_token)
             locked_connection = ZoomOAuthConnection.objects.select_for_update().select_related("zoom_oauth_app").filter(pk=connection.pk, zoom_oauth_app__project=project).first()
+            _require_live_claim(claimed, lease_token)
             if locked_connection is None:
                 raise DatabaseVerificationError()
             if claimed.target_generation and claimed.target_generation != locked_connection.authorization_generation:
@@ -669,6 +690,7 @@ def process_connection_revoke(
                 locked_connection.state = ZoomOAuthConnectionStates.REMOVING
                 locked_connection.save(update_fields=["state", "updated_at"])
             connection = locked_connection
+            _require_live_claim(claimed, lease_token)
 
         provider_outcome = _revoke_at_zoom(connection)
 
@@ -680,11 +702,9 @@ def process_connection_revoke(
                 failure_code=provider_outcome.failure_code,
             )
 
-        now = timezone.now()
         with transaction.atomic():
             claimed = ZoomRemovalOperation.objects.select_for_update().get(pk=operation.pk)
-            if claimed.lease_token != lease_token:
-                raise LeaseLost()
+            _require_live_claim(claimed, lease_token)
             locked_connection = (
                 ZoomOAuthConnection.objects.select_for_update()
                 .filter(
@@ -695,6 +715,7 @@ def process_connection_revoke(
                 )
                 .first()
             )
+            _require_live_claim(claimed, lease_token)
             if locked_connection is None:
                 raise DatabaseVerificationError()
             WebhookDeliveryAttempt.objects.filter(zoom_oauth_connection=locked_connection).delete()
@@ -702,6 +723,8 @@ def process_connection_revoke(
             if ZoomOAuthConnection.objects.filter(pk=connection.pk).exists():
                 raise DatabaseVerificationError()
 
+            now = _require_live_claim(claimed, lease_token)
+            deadline = claimed.lease_expires_at
             claimed.state = ZoomRemovalOperationStates.REVOKED
             claimed.phase = ZoomRemovalOperationPhases.COMPLETE
             claimed.failure_code = provider_outcome.failure_code
@@ -718,6 +741,7 @@ def process_connection_revoke(
                 else "provider_revoke"
             )
             claimed.save()
+            _require_unexpired(deadline)
             return claimed
     except LeaseLost:
         return ZoomRemovalOperation.objects.get(pk=operation.pk)
@@ -779,9 +803,9 @@ def _delete_bot_dependents_and_row(
 
     with transaction.atomic():
         operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
-        if operation.lease_token != lease_token:
-            raise LeaseLost()
+        _require_live_claim(operation, lease_token)
         locked_bot = Bot.objects.select_for_update().get(pk=bot_pk)
+        _require_live_claim(operation, lease_token)
         if locked_bot.removal_requested_at is None or locked_bot.runtime_absence_confirmed_at is None or locked_bot.runtime_absence_generation != locked_bot.runtime_generation or operation.target_generation != locked_bot.runtime_generation:
             raise DatabaseVerificationError()
         WebhookDeliveryAttempt.objects.filter(bot_id=bot_pk).delete()
@@ -813,11 +837,14 @@ def _delete_bot_dependents_and_row(
         # The database-deleted proof phase commits atomically with the target's
         # last row. A process crash can therefore never turn our own deletion
         # into an unproved bare 404 on replay.
+        now = _require_live_claim(operation, lease_token)
+        deadline = operation.lease_expires_at
         operation.phase = ZoomRemovalOperationPhases.DATABASE_DELETED
         operation.state = ZoomRemovalOperationStates.DATA_DELETED
         operation.failure_code = None
-        operation.lease_expires_at = timezone.now() + timedelta(seconds=LEASE_SECONDS)
+        operation.lease_expires_at = now + timedelta(seconds=LEASE_SECONDS)
         operation.save(update_fields=["phase", "state", "failure_code", "lease_expires_at", "updated_at"])
+        _require_unexpired(deadline)
         return operation
 
 
@@ -828,9 +855,9 @@ def _database_absence_is_verified(project: Project, target_object_id: str) -> bo
 def _fence_bot_for_removal(bot: Bot, operation_id: int, lease_token: uuid.UUID) -> Bot:
     with transaction.atomic():
         operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation_id)
-        if operation.lease_token != lease_token:
-            raise LeaseLost()
+        _require_live_claim(operation, lease_token)
         locked_bot = Bot.objects.select_for_update().get(pk=bot.pk)
+        _require_live_claim(operation, lease_token)
         if operation.target_generation and operation.target_generation != locked_bot.runtime_generation:
             raise DatabaseVerificationError()
         if operation.target_generation is None:
@@ -839,6 +866,7 @@ def _fence_bot_for_removal(bot: Bot, operation_id: int, lease_token: uuid.UUID) 
         if locked_bot.removal_requested_at is None:
             locked_bot.removal_requested_at = timezone.now()
             locked_bot.save(update_fields=["removal_requested_at", "updated_at"])
+        _require_live_claim(operation, lease_token)
         return locked_bot
 
 
@@ -883,8 +911,11 @@ def process_bot_purge(*, project: Project, operation_id: uuid.UUID, bot_object_i
 
         if operation.phase == ZoomRemovalOperationPhases.PENDING:
             manifest = operation.storage_manifest or _storage_manifest(bot)
-            if not operation.storage_manifest:
-                operation = _update_claimed(operation.pk, lease_token, storage_manifest=manifest)
+            # Even a retry with an existing manifest must still own a live
+            # lease before beginning external storage work. External I/O
+            # already in progress cannot be rolled back; the post-I/O check
+            # prevents an expired worker from recording success or advancing.
+            operation = _update_claimed(operation.pk, lease_token, storage_manifest=manifest)
             _delete_and_verify_storage(manifest)
             operation = _update_claimed(
                 operation.pk,
@@ -895,24 +926,31 @@ def process_bot_purge(*, project: Project, operation_id: uuid.UUID, bot_object_i
             )
 
         if operation.phase == ZoomRemovalOperationPhases.STORAGE_VERIFIED:
-            bot = Bot.objects.get(project=project, object_id=bot_object_id)
-            if bot.state in {BotStates.DATA_DELETED, BotStates.SCHEDULED, BotStates.STAGED}:
-                bot.ensure_data_deleted()
-            else:
-                bot.delete_data()
-            operation = _update_claimed(
-                operation.pk,
-                lease_token,
-                phase=ZoomRemovalOperationPhases.DATA_DELETED,
-                state=ZoomRemovalOperationStates.DATA_DELETED,
-                failure_code=None,
-            )
+            with transaction.atomic():
+                operation = ZoomRemovalOperation.objects.select_for_update().get(pk=operation.pk)
+                _require_live_claim(operation, lease_token)
+                bot = Bot.objects.select_for_update().get(project=project, object_id=bot_object_id)
+                _require_live_claim(operation, lease_token)
+                if bot.state in {BotStates.DATA_DELETED, BotStates.SCHEDULED, BotStates.STAGED}:
+                    bot.ensure_data_deleted()
+                else:
+                    bot.delete_data()
+                # Renew only while still live, in the same transaction as
+                # the destructive database changes, so expiry rolls them back.
+                operation = _update_claimed(
+                    operation.pk,
+                    lease_token,
+                    phase=ZoomRemovalOperationPhases.DATA_DELETED,
+                    state=ZoomRemovalOperationStates.DATA_DELETED,
+                    failure_code=None,
+                )
 
         if operation.phase == ZoomRemovalOperationPhases.DATA_DELETED:
             bot = Bot.objects.get(project=project, object_id=bot_object_id)
             operation = _delete_bot_dependents_and_row(bot, operation.target_digest, operation.pk, lease_token)
 
         if operation.phase == ZoomRemovalOperationPhases.DATABASE_DELETED:
+            operation = _update_claimed(operation.pk, lease_token)
             _delete_and_verify_storage(operation.storage_manifest)
             if not _database_absence_is_verified(project, bot_object_id):
                 raise DatabaseVerificationError()
