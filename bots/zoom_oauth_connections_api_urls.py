@@ -8,6 +8,7 @@ urlpatterns = [
     path("zoom_retention/revoke", zoom_retention_api_views.ZoomConnectionRevokeView.as_view(), name="zoom-retention-revoke"),
     path("zoom_retention/purge", zoom_retention_api_views.ZoomBotPurgeView.as_view(), name="zoom-retention-purge"),
     path("zoom_retention/deauthorization", zoom_retention_api_views.ZoomSignedDeauthorizationView.as_view(), name="zoom-retention-deauthorization"),
+    path("zoom_retention/deauthorization/recover", zoom_retention_api_views.ZoomSignedDeauthorizationRecoverView.as_view(), name="zoom-retention-deauthorization-recover"),
     path("zoom_retention/deauthorization/resolve", zoom_retention_api_views.ZoomSignedDeauthorizationResolveView.as_view(), name="zoom-retention-deauthorization-resolve"),
     path("zoom_retention/operations/<uuid:operation_id>", zoom_retention_api_views.ZoomRemovalOperationDetailView.as_view(), name="zoom-retention-operation-detail"),
 ]

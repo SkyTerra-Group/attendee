@@ -19,7 +19,6 @@ from django.urls import NoReverseMatch, reverse
 from bots.models import (
     Project,
     ZoomOAuthApp,
-    ZoomOAuthAuthorizationGrant,
     ZoomRemovalAuditKeyFingerprint,
 )
 from bots.zoom_deauthorization_assertion import _registry
@@ -47,9 +46,11 @@ _SIGNER_FIELDS = {"zoom_oauth_app_id", "expected_client_id_digest", "issuer", "a
 _REQUIRED_ROUTES = (
     "zoom-retention-deauthorization",
     "zoom-retention-deauthorization-resolve",
+    "zoom-retention-deauthorization-recover",
     "zoom-retention-operation-detail",
 )
 _REQUIRED_MIGRATIONS = {
+    "0098_zoom_deauth_clock_recovery",
     "0094_zoom_deauthorization_trust",
     "0095_zoom_deauth_operation_event_digest_consistency",
     "0096_zoom_deauth_audit_keyring_readiness",
@@ -58,6 +59,7 @@ _REQUIRED_MIGRATIONS = {
 # initially-deferred, UPDATE-OF columns).  This prevents an enabled same-name
 # no-op or INSERT/UPDATE-only replacement from satisfying readiness.
 _REQUIRED_TRIGGERS = {
+    ("bots_zoomdeauthorizationclockrecovery", "zoom_deauth_clock_recovery_immutable"): (31, "bots_zoomdeauth_clock_recovery_immutable", "04c54fa3256a0397448afec87b8458ce4da0c7b937082dbcea1513a67793e737", False, False, False, ()),
     ("bots_zoomoauthauthorizationgrantclocksample", "zoom_deauth_grant_clock_sample_immutable"): (23, "bots_zoomdeauth_grant_clock_sample_immutable", "4bd4d8e86c71df217a708904028161ab4862a7afaa66d986db8bee5deff20607", False, False, False, ()),
     ("bots_zoomdeauthorizationassertionreceipt", "zoom_deauth_receipt_immutable"): (19, "bots_zoomdeauth_receipt_immutable", "c7f939d9c8727dcb57775a0972751dea9877a614ff10a6eef6378be9b46531b5", False, False, False, ()),
     ("bots_zoomdeauthorizationassertionreceipt", "zoom_deauth_receipt_scoped_links"): (23, "bots_zoomdeauth_receipt_scope", "bc609c744eed19e734e5502b21eef9d4f31dc6137aebf7f8631a30cc1dd78d4f", False, False, False, ()),
@@ -87,7 +89,7 @@ _REQUIRED_TRIGGERS = {
 # exact table so a same-name object elsewhere cannot satisfy readiness.
 _REQUIRED_CONSTRAINTS = {
     ("bots_zoomdeauthorizationassertionreceipt", "unique_zoom_deauth_assertion_nonce"): ("u", "56266d47702665247f7fcef4f032bc5b9713fb7499e770961393a133bbe8026b"),
-    ("bots_zoomdeauthorizationassertionreceipt", "zoom_assertion_receipt_target_matches_purpose"): ("c", "9d14917e5691bbb90fa57767b13c389c86942952d3eea7873e929e4fac96fdac"),
+    ("bots_zoomdeauthorizationassertionreceipt", "zoom_assertion_receipt_target_matches_purpose"): ("c", "a4e2edca8a642e0f4c763c54cb0d19261eb8d231cc5d4bb0fe08b5a0f24bf2e3"),
     ("bots_zoomdeauthorizationeventbinding", "unique_zoom_deauthorization_event_binding"): ("u", "ca4ec0bede9e7b7495c96324b83143140ecdfd804c50ca45fe0a5db546c4aa50"),
     ("bots_zoomdeauthorizationeventbinding", "zoom_event_binding_terminal_evidence_complete"): ("c", "c84bbce90d7ba5539566c1e32ce67d0dc710ed2e519987d7e5e619a8498d60e1"),
     ("bots_zoomdeauthorizationeventbinding", "zoom_event_binding_version_positive"): ("c", "7ee3c8c0bc3bc1448c413d68cce82e740bff22a3d43fe5e211071ffba983cec6"),
@@ -209,9 +211,8 @@ def _canonical_public_key(encoded) -> bytes:
 
 def _validate_routes() -> None:
     try:
-        reverse(_REQUIRED_ROUTES[0])
-        reverse(_REQUIRED_ROUTES[1])
-        reverse(_REQUIRED_ROUTES[2], kwargs={"operation_id": uuid.uuid4()})
+        for route in _REQUIRED_ROUTES:
+            reverse(route, kwargs={"operation_id": uuid.uuid4()} if route == "zoom-retention-operation-detail" else None)
     except NoReverseMatch:
         _fail("route_unavailable")
 

@@ -12,11 +12,13 @@ from .throttling import ProjectPostThrottle
 from .zoom_deauthorization import (
     CommittedDeauthorizationError,
     DeauthorizationServiceError,
+    recover_verified_deauthorization,
     resolve_verified_deauthorization,
     settle_verified_deauthorization,
 )
 from .zoom_deauthorization_assertion import (
     MAX_ASSERTION_BYTES,
+    RECOVER_PURPOSE,
     RESOLVE_PURPOSE,
     SETTLE_PURPOSE,
     AssertionRejected,
@@ -115,6 +117,22 @@ class ZoomSignedDeauthorizationResolveView(GenericAPIView):
         try:
             assertion = _verified_assertion(request, RESOLVE_PURPOSE)
             result = resolve_verified_deauthorization(request.auth.project, assertion)
+        except AssertionRejected as error:
+            return Response({"error": error.code}, status=status.HTTP_401_UNAUTHORIZED)
+        except DeauthorizationServiceError as error:
+            return _signed_error_response(error)
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class ZoomSignedDeauthorizationRecoverView(GenericAPIView):
+    authentication_classes = [ApiKeyAuthentication]
+    throttle_classes = [ProjectPostThrottle]
+
+    def post(self, request):
+        _require_enabled()
+        try:
+            assertion = _verified_assertion(request, RECOVER_PURPOSE)
+            result = recover_verified_deauthorization(request.auth.project, assertion)
         except AssertionRejected as error:
             return Response({"error": error.code}, status=status.HTTP_401_UNAUTHORIZED)
         except DeauthorizationServiceError as error:

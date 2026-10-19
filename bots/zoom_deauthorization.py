@@ -17,6 +17,7 @@ from bots.models import (
     Project,
     WebhookDeliveryAttempt,
     ZoomDeauthorizationAssertionReceipt,
+    ZoomDeauthorizationClockRecovery,
     ZoomDeauthorizationEventBinding,
     ZoomDeauthorizationResolutionOutcomes,
     ZoomDeauthorizationTargetResolution,
@@ -32,20 +33,19 @@ from bots.models import (
     ZoomRemovalOperationTypes,
 )
 from bots.zoom_deauthorization_assertion import (
-    CREATE_IF_FRESH,
-    EXISTING_ONLY,
     CLOCK_MEASUREMENT_POLICY,
     CREATE_IF_FRESH,
+    EXISTING_ONLY,
     TEMPORAL_POLICY,
     TEMPORAL_POLICY_V2,
     VerifiedDeauthorizationAssertion,
 )
 from bots.zoom_deauthorization_grants import (
     GrantCaptureUnavailable,
-    sample_database_clock,
     database_clock_now,
     expected_client_id_digest,
     find_provider_identity_lineage,
+    sample_database_clock,
 )
 from bots.zoom_retention import (
     RECEIPT_RETENTION_DAYS,
@@ -57,6 +57,7 @@ from bots.zoom_retention import (
     operation_result,
 )
 
+RECOVERY_POLICY = "single-open-first-grant-deferred-v1"
 U_SECONDS = 62
 MAX_FRESH_SPAN_SECONDS = 29
 MAX_COMBINED_CLOCK_ERROR_MS = 1000
@@ -218,7 +219,7 @@ def _validate_existing_binding_claims(binding: ZoomDeauthorizationEventBinding, 
     claims = assertion.claims
     snapshot = binding.evidence_snapshot
     # A binding is recovered only by claims of the policy it was bound under.
-    if claims["temporal_policy"] != binding.temporal_policy:
+    if claims["temporal_policy"] != (TEMPORAL_POLICY if binding.temporal_policy == RECOVERY_POLICY else binding.temporal_policy):
         raise DeauthorizationServiceError("event_binding_conflict")
     immutable = {
         "zoom_event_at": claims["zoom_event_at"],
@@ -231,7 +232,7 @@ def _validate_existing_binding_claims(binding: ZoomDeauthorizationEventBinding, 
         fields = _EVIDENCE_SNAPSHOT_FIELDS
         immutable.update({name: claims[name] for name in (
             "client_clock_health_id", "client_clock_continuous", "client_clock_step_free", "client_clock_error_ms")})
-    elif binding.temporal_policy == TEMPORAL_POLICY:
+    elif binding.temporal_policy in {TEMPORAL_POLICY, RECOVERY_POLICY}:
         fields = _V3_EVIDENCE_SNAPSHOT_FIELDS
         # Issuance error differs per assertion; the receipt sample does not.
         immutable.update({name: claims[name] for name in (
@@ -274,7 +275,7 @@ def _candidate_snapshot(
         "first_verified_at": claims["first_verified_at"],
         "binding_attempt_iat": claims["iat"],
         # The sampled provider binding instant, not a later unsampled now().
-        "attendee_binding_received_at": _utc_iso(binding_sample.db_at),
+        "attendee_binding_received_at": _utc_iso(binding_sample.db_at) if binding_sample else None,
         "zoom_event_precision_ms": claims["zoom_event_precision_ms"],
         "zoom_request_precision_ms": claims["zoom_request_precision_ms"],
         "generation_started_at": _utc_iso(grant.generation_started_at),
@@ -283,9 +284,9 @@ def _candidate_snapshot(
         "client_clock_source_policy_id": claims["client_clock_source_policy_id"],
         "client_receipt_clock_error_ms": claims["client_receipt_clock_error_ms"],
         "client_issuance_clock_error_ms": claims["client_issuance_clock_error_ms"],
-        "attendee_clock_source_policy_id": binding_sample.source_policy_id,
+        "attendee_clock_source_policy_id": binding_sample.source_policy_id if binding_sample else start_sample.source_policy_id,
         "attendee_boundary_clock_error_ms": [start_sample.error_ms, end_sample.error_ms if end_sample else None],
-        "attendee_binding_clock_error_ms": binding_sample.error_ms,
+        "attendee_binding_clock_error_ms": binding_sample.error_ms if binding_sample else None,
         "grant_binding_id": str(grant.binding_id),
         "connection_generation": str(grant.authorization_generation),
         "lineage_sequence": grant.grant_sequence,
@@ -295,7 +296,7 @@ def _candidate_snapshot(
 
 
 def candidate_temporal_evidence_digest(snapshot: dict) -> str:
-    if snapshot["temporal_policy"] == TEMPORAL_POLICY:
+    if snapshot["temporal_policy"] in {TEMPORAL_POLICY, RECOVERY_POLICY}:
         # v3 cross-repository wire contract: every sampled bound is digested.
         ordered = [snapshot[name] for name in (
             "temporal_policy", "zoom_event_at", "zoom_request_signed_at", "first_verified_at",
@@ -462,7 +463,7 @@ def _create_event_binding(assertion, app, grant, operation, snapshot, candidate_
         grant_binding_id=grant.binding_id,
         connection_digest=grant.connection_digest,
         authorization_generation=grant.authorization_generation,
-        temporal_policy=TEMPORAL_POLICY,
+        temporal_policy=snapshot["temporal_policy"],
         candidate_evidence_digest=candidate_digest,
         binding_evidence_digest=binding_digest,
         evidence_snapshot=snapshot,
@@ -621,6 +622,10 @@ def resolve_verified_deauthorization(project: Project, assertion: VerifiedDeauth
         ).first()
         if binding:
             _validate_existing_binding_claims(binding, assertion)
+            recovery = ZoomDeauthorizationClockRecovery.objects.filter(event_binding=binding).first()
+            if recovery:
+                _record_receipt(assertion, app, resolution=recovery.resolution)
+                return recovery_result(recovery)
             resolution = _resolution_from_binding(project, app, binding)
             _record_receipt(assertion, app, resolution=resolution)
             return resolution_result(resolution)
@@ -727,6 +732,118 @@ def resolve_verified_deauthorization(project: Project, assertion: VerifiedDeauth
         )
         _record_receipt(assertion, app, resolution=resolution)
         return resolution_result(resolution)
+
+
+def recovery_result(recovery):
+    """Project the new binding without changing the historical refusal row."""
+    binding = recovery.event_binding
+    if binding.operation_id is None or binding.authorization_grant_id is None:
+        raise DeauthorizationServiceError("bound_event_result_expired")
+    # An unsaved projection reuses the ordinary exact response vocabulary.
+    projection = ZoomDeauthorizationTargetResolution(
+        resolution_id=recovery.resolution.resolution_id,
+        project=binding.project, zoom_oauth_app=binding.zoom_oauth_app,
+        event_digest=binding.event_digest,
+        outcome=ZoomDeauthorizationResolutionOutcomes.RESOLVED_EXISTING_BINDING,
+        event_binding=binding, authorization_grant=binding.authorization_grant,
+        operation=binding.operation, grant_binding_id=binding.grant_binding_id,
+        connection_digest=binding.connection_digest,
+        authorization_generation=binding.authorization_generation,
+        binding_evidence_digest=binding.binding_evidence_digest,
+    )
+    return resolution_result(projection)
+
+
+def _deferred_binding_evidence(assertion, grant):
+    claims = assertion.claims
+    # No accepted sample is synthesized from a later sample or from the
+    # signed request timestamp. Null is the original rejection representation.
+    if (claims["temporal_policy"] != TEMPORAL_POLICY
+            or claims["binding_mode"] != EXISTING_ONLY
+            or not claims.get("client_clock_source_policy_id")
+            or any(type(claims.get(name)) is not int or not 0 <= claims[name] <= 1000
+                   for name in ("client_receipt_clock_error_ms",))):
+        raise DeauthorizationServiceError("recovery_receipt_unbounded")
+    if type(claims.get("client_issuance_clock_error_ms")) is not int or not 0 <= claims["client_issuance_clock_error_ms"] <= 1000:
+        raise DeauthorizationServiceError("clock_untrusted")
+    times = [claims[name] for name in ("zoom_event_at", "zoom_request_signed_at", "first_verified_at")]
+    if claims["zoom_event_at"] > claims["zoom_request_signed_at"] or max(times) - min(times) > MAX_FRESH_SPAN_SECONDS:
+        raise DeauthorizationServiceError("recovery_receipt_unbounded")
+    samples = {sample.boundary: sample for sample in grant.clock_samples.all()}
+    start = samples.get("start")
+    if (start is None or start.sampled_at != grant.generation_started_at
+            or start.measurement_policy != CLOCK_MEASUREMENT_POLICY or "end" in samples):
+        raise DeauthorizationServiceError("recovery_start_unsampled")
+    if claims["client_receipt_clock_error_ms"] + start.error_ms > MAX_COMBINED_CLOCK_ERROR_MS:
+        raise DeauthorizationServiceError("recovery_budget_exceeded")
+    if claims["client_issuance_clock_error_ms"] + start.error_ms > MAX_COMBINED_CLOCK_ERROR_MS:
+        raise DeauthorizationServiceError("clock_untrusted")
+    if not grant.generation_started_at < _datetime_from_epoch(claims["zoom_event_at"]) - timedelta(seconds=U_SECONDS):
+        raise DeauthorizationServiceError("recovery_order_unproven")
+    snapshot = _candidate_snapshot(assertion, grant, start, None, None)
+    snapshot["temporal_policy"] = RECOVERY_POLICY
+    return snapshot, candidate_temporal_evidence_digest(snapshot)
+
+
+def recover_verified_deauthorization(project, assertion):
+    """Bind only an unchanged, still-open first grant from original bounded evidence."""
+    claims = assertion.claims
+    with transaction.atomic():
+        app = _exact_app(project, assertion)
+        _assert_signed_app_ready(app)
+        _event_lock(project.pk, app.pk, assertion.event_digest)
+        _nonce_lock(project.pk, app.pk, claims["iss"], assertion.nonce_digest)
+        _assert_nonce_unused(project, app, assertion)
+        resolution = ZoomDeauthorizationTargetResolution.objects.select_for_update().filter(
+            project=project, zoom_oauth_app=app, event_digest=assertion.event_digest,
+        ).first()
+        if (resolution is None or resolution.outcome not in {
+                ZoomDeauthorizationResolutionOutcomes.CLOCK_UNTRUSTED,
+                ZoomDeauthorizationResolutionOutcomes.DELAYED_EVENT_UNBOUND,
+            } or any(value is not None for value in (
+                resolution.event_binding_id, resolution.authorization_grant_id,
+                resolution.operation_id, resolution.grant_binding_id, resolution.connection_digest,
+                resolution.authorization_generation, resolution.binding_evidence_digest))):
+            raise DeauthorizationServiceError("recovery_resolution_ineligible")
+        recovery = ZoomDeauthorizationClockRecovery.objects.select_related("event_binding", "resolution").filter(resolution=resolution).first()
+        if recovery:
+            _validate_existing_binding_claims(recovery.event_binding, assertion)
+            result = recovery_result(recovery)
+            _record_receipt(assertion, app, resolution=resolution)
+            return result
+        if ZoomDeauthorizationEventBinding.objects.filter(project=project, zoom_oauth_app=app, event_digest=assertion.event_digest).exists():
+            raise DeauthorizationServiceError("event_binding_conflict")
+        if not hmac.compare_digest(expected_client_id_digest(claims["zoom_client_id"]), assertion.signer["expected_client_id_digest"]):
+            raise DeauthorizationServiceError("scope_not_found", status_code=404)
+        try:
+            lineage, _ = find_provider_identity_lineage(project, app, claims["zoom_user_id"], claims["zoom_account_id"], for_update=True)
+        except GrantCaptureUnavailable as error:
+            raise DeauthorizationServiceError(error.args[0]) from None
+        if lineage is None or not lineage.history_complete or lineage.has_prior_grant or lineage.latest_grant_sequence != 1:
+            raise DeauthorizationServiceError("recovery_generation_changed")
+        grants = list(ZoomOAuthAuthorizationGrant.objects.select_for_update().filter(project=project, zoom_oauth_app=app, lineage=lineage))
+        if len(grants) != 1:
+            raise DeauthorizationServiceError("recovery_generation_changed")
+        grant = grants[0]
+        if grant.grant_sequence != 1 or grant.legacy_history or grant.generation_ended_at is not None or grant.live_connection_id is None:
+            raise DeauthorizationServiceError("recovery_generation_changed")
+        live = ZoomOAuthConnection.objects.select_for_update().filter(
+            pk=grant.live_connection_id, zoom_oauth_app=app,
+            authorization_generation=grant.authorization_generation,
+        ).first()
+        if live is None:
+            raise DeauthorizationServiceError("recovery_generation_changed")
+        snapshot, candidate_digest = _deferred_binding_evidence(assertion, grant)
+        operation, _ = _grant_operation(grant, uuid.uuid4(), source=ZoomRemovalOperationSources.ZOOM_DEAUTHORIZATION)
+        _assert_operation_binding(operation, grant, assertion)
+        binding = _create_event_binding(assertion, app, grant, operation, snapshot, candidate_digest)
+        recovery = ZoomDeauthorizationClockRecovery.objects.create(
+            resolution=resolution, event_binding=binding,
+            canonical_operation_id=canonical_operation_id(operation),
+            recovery_policy=RECOVERY_POLICY, evidence_digest=binding.binding_evidence_digest,
+        )
+        _record_receipt(assertion, app, resolution=resolution)
+        return recovery_result(recovery)
 
 
 def _settle_operation(operation, grant, binding, assertion):
@@ -862,10 +979,12 @@ def settle_verified_deauthorization(project: Project, assertion: VerifiedDeautho
                 )
                 .first()
             )
+            recovery = ZoomDeauthorizationClockRecovery.objects.filter(event_binding=binding).first()
+            expected_resolution = recovery.resolution if recovery else resolution
             claimed_resolution = claims.get("resolution_id")
-            if (resolution is None and claimed_resolution is not None) or (
-                resolution is not None
-                and claimed_resolution != str(resolution.resolution_id)
+            if (expected_resolution is None and claimed_resolution is not None) or (
+                expected_resolution is not None
+                and claimed_resolution != str(expected_resolution.resolution_id)
             ):
                 raise DeauthorizationServiceError("resolution_mismatch")
             try:

@@ -962,6 +962,20 @@ class ZoomDeauthorizationTargetResolution(models.Model):
         ]
 
 
+class ZoomDeauthorizationClockRecovery(models.Model):
+    """Permanent append-only association; the original resolution stays frozen."""
+
+    recovery_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    resolution = models.OneToOneField(ZoomDeauthorizationTargetResolution, on_delete=models.PROTECT, related_name="clock_recovery")
+    event_binding = models.OneToOneField(ZoomDeauthorizationEventBinding, on_delete=models.PROTECT, related_name="clock_recovery")
+    # A scalar permits ordinary operation-receipt expiry without rewriting the
+    # permanent recovery association or retaining raw identifiers/content.
+    canonical_operation_id = models.UUIDField()
+    recovery_policy = models.CharField(max_length=64)
+    evidence_digest = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class ZoomDeauthorizationAssertionReceipt(models.Model):
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="zoom_deauthorization_assertion_receipts")
     zoom_oauth_app = models.ForeignKey(ZoomOAuthApp, on_delete=models.PROTECT, related_name="deauthorization_assertion_receipts")
@@ -996,7 +1010,7 @@ class ZoomDeauthorizationAssertionReceipt(models.Model):
             ),
             models.CheckConstraint(
                 condition=(models.Q(purpose="zoom-deauthorization:settle", operation__isnull=False, resolution__isnull=True)
-                | models.Q(purpose="zoom-deauthorization:resolve", operation__isnull=True, resolution__isnull=False)),
+                | models.Q(purpose__in=["zoom-deauthorization:resolve", "zoom-deauthorization:recover"], operation__isnull=True, resolution__isnull=False)),
                 name="zoom_assertion_receipt_target_matches_purpose",
             ),
         ]

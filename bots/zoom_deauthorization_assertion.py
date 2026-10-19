@@ -32,6 +32,7 @@ TEMPORAL_POLICY = "first-grant-sampled-u62-v3"
 CLOCK_MEASUREMENT_POLICY = "operation-sampled-utc-bound-v1"
 SETTLE_PURPOSE = "zoom-deauthorization:settle"
 RESOLVE_PURPOSE = "zoom-deauthorization:resolve"
+RECOVER_PURPOSE = "zoom-deauthorization:recover"
 CREATE_IF_FRESH = "create_if_fresh"
 EXISTING_ONLY = "existing_only"
 MAX_ASSERTION_BYTES = 8192
@@ -289,7 +290,7 @@ def _validate_common_claims(claims: dict, signer: dict, project_object_id: str, 
 def verify_deauthorization_assertion(assertion: str, *, project, purpose: str, received_at: datetime) -> VerifiedDeauthorizationAssertion:
     """Verify one closed resolver or settlement assertion for ``project``."""
 
-    if purpose not in {SETTLE_PURPOSE, RESOLVE_PURPOSE}:
+    if purpose not in {SETTLE_PURPOSE, RESOLVE_PURPOSE, RECOVER_PURPOSE}:
         raise AssertionRejected("purpose_invalid")
     if type(assertion) is not str or not assertion or len(assertion.encode("ascii", "ignore")) != len(assertion) or len(assertion) > MAX_ASSERTION_BYTES:
         raise AssertionRejected("assertion_invalid")
@@ -321,6 +322,9 @@ def verify_deauthorization_assertion(assertion: str, *, project, purpose: str, r
         raise AssertionRejected("purpose_invalid")
     _validate_claim_schema(claims, purpose)
     _validate_common_claims(claims, signer, project.object_id, received_at)
+
+    if purpose == RECOVER_PURPOSE and (claims["temporal_policy"] != TEMPORAL_POLICY or claims["binding_mode"] != EXISTING_ONLY):
+        raise AssertionRejected("recovery_mode_invalid")
 
     if purpose == SETTLE_PURPOSE:
         for name in ("operation_id", "grant_binding_id", "connection_generation"):

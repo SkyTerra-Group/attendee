@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from datetime import timezone as datetime_timezone
 from io import StringIO
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from bots.models import (
     WebhookSubscription,
     WebhookTriggerTypes,
     ZoomDeauthorizationAssertionReceipt,
+    ZoomDeauthorizationClockRecovery,
     ZoomDeauthorizationEventBinding,
     ZoomDeauthorizationResolutionOutcomes,
     ZoomDeauthorizationTargetResolution,
@@ -60,20 +62,24 @@ from bots.tests.zoom_log_capture import (
     CaptureConfiguredZoomLogBytes,
     CaptureZoomLogBytes,
 )
+from bots.zoom_clock_sample import Kernel, LocalProbe, Sample
 from bots.zoom_deauthorization import (
+    RECOVERY_POLICY,
     DeauthorizationServiceError,
     _candidate_snapshot,
+    _deferred_binding_evidence,
     binding_temporal_evidence_digest,
     candidate_temporal_evidence_digest,
     resolution_result,
 )
 from bots.zoom_deauthorization_assertion import (
     ASSERTION_TYP,
+    CLOCK_MEASUREMENT_POLICY,
     CREATE_IF_FRESH,
     EXISTING_ONLY,
+    RECOVER_PURPOSE,
     RESOLVE_PURPOSE,
     SETTLE_PURPOSE,
-    CLOCK_MEASUREMENT_POLICY,
     TEMPORAL_POLICY,
     TEMPORAL_POLICY_V2,
     AssertionRejected,
@@ -87,7 +93,6 @@ from bots.zoom_deauthorization_grants import (
     expected_client_id_digest,
     provider_identity_digest,
 )
-from bots.zoom_clock_sample import Kernel, LocalProbe, Sample
 from bots.zoom_deauthorization_readiness import DeauthorizationReadinessError, collect_readiness
 from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
 from bots.zoom_removal_audit import (
@@ -3120,6 +3125,243 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             self.zoom_app.object_id,
         )
         self.assertIn(b"code=invalid_signature", rejected_logs.bytes)
+
+
+    def _deferred_claims(self, *, outcome="delayed_event_unbound", **original):
+        if outcome == "delayed_event_unbound":
+            original = {"mode": EXISTING_ONLY, "event_at": self.now - 43, "request_at": self.now - 43, "first_at": self.now - 43, **original}
+        claims = self.resolve_claims(**original)
+        with patch("bots.zoom_deauthorization.sample_database_clock", return_value=(None, "clock_rejected")) if outcome == "clock_untrusted" else patch("bots.zoom_deauthorization.sample_database_clock", return_value=(self.binding_sample, None)):
+            response = self.post_assertion("/api/v1/zoom_retention/deauthorization/resolve", claims)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["outcome"], outcome)
+        claims.update(purpose=RECOVER_PURPOSE, binding_mode=EXISTING_ONLY, jti=str(uuid.uuid4()))
+        return claims
+
+    def _recovery_rows(self):
+        models = (ZoomDeauthorizationTargetResolution, ZoomDeauthorizationClockRecovery,
+                  ZoomDeauthorizationEventBinding, ZoomRemovalOperation, ZoomRemovalOperationIdentifier,
+                  ZoomDeauthorizationAssertionReceipt, ZoomOAuthAuthorizationGrant, ZoomOAuthConnection)
+        return [list(model.objects.order_by("pk").values()) for model in models]
+
+    def _assert_recovery_refusal(self, claims, code, status=409):
+        before = self._recovery_rows()
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+        self.assertEqual(response.status_code, status, response.content)
+        self.assertEqual(response.json(), {"error": code})
+        self.assertEqual(self._recovery_rows(), before)
+
+    def test_deferred_recovery_schema_integrity(self):
+        with django_db_connection.cursor() as cursor:
+            cursor.execute("SELECT current_database(), pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='zoom_assertion_receipt_target_matches_purpose'")
+            dbname, definition = cursor.fetchone()
+        self.assertTrue(dbname.startswith("test_"), dbname)
+        self.assertEqual(hashlib.sha256(definition.encode()).hexdigest(), "a4e2edca8a642e0f4c763c54cb0d19261eb8d231cc5d4bb0fe08b5a0f24bf2e3")
+
+    def test_deferred_recovery_clock_rejection_and_dispatch_delay(self):
+        for outcome in ("clock_untrusted", "delayed_event_unbound"):
+            # Each test event receives an independent operation, so the second
+            # variant is exercised by rolling back the complete fixture work.
+            with transaction.atomic():
+                claims = self._deferred_claims(outcome=outcome)
+                before = list(ZoomDeauthorizationTargetResolution.objects.values())
+                with patch("bots.zoom_deauthorization.sample_database_clock") as sampled:
+                    response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+                sampled.assert_not_called()
+                self.assertEqual(response.status_code, 200, response.content)
+                result = response.json()
+                self.assertEqual(result["outcome"], "resolved_existing_binding")
+                self.assertEqual(list(ZoomDeauthorizationTargetResolution.objects.values()), before)
+                binding = ZoomDeauthorizationEventBinding.objects.get()
+                self.assertEqual(binding.temporal_policy, RECOVERY_POLICY)
+                self.assertIsNone(binding.evidence_snapshot["attendee_binding_received_at"])
+                self.assertIsNone(binding.evidence_snapshot["attendee_binding_clock_error_ms"])
+                readback = self.client.get("/api/v1/zoom_retention/operations/" + result["operation_id"], HTTP_AUTHORIZATION=f"Token {self.api_key}")
+                self.assertEqual(readback.status_code, 200, readback.content)
+                self.assertEqual(readback.json()["temporal_policy"], RECOVERY_POLICY)
+                settlement = {key: value for key, value in claims.items() if key not in {"zoom_client_id", "zoom_user_id", "zoom_account_id"}}
+                settlement.update(purpose=SETTLE_PURPOSE, jti=str(uuid.uuid4()), **{key:result[key] for key in ("operation_id", "grant_binding_id", "connection_digest", "connection_generation", "temporal_evidence_digest", "resolution_id")})
+                with patch("bots.zoom_retention._revoke_at_zoom") as revoke:
+                    settled = self.post_assertion("/api/v1/zoom_retention/deauthorization", settlement)
+                revoke.assert_not_called()
+                self.assertEqual(settled.status_code, 200, settled.content)
+                self.assertEqual(settled.json()["temporal_policy"], RECOVERY_POLICY)
+                self.assertFalse(ZoomOAuthConnection.objects.filter(pk=self.connection.pk).exists())
+                self.assertEqual(list(ZoomDeauthorizationTargetResolution.objects.values()), before)
+                later = database_clock_now() + timedelta(days=RECEIPT_RETENTION_DAYS + 1)
+                with patch("bots.zoom_retention.timezone.now", return_value=later):
+                    self.assertEqual(delete_expired_receipts(), 1)
+                self.assertTrue(ZoomDeauthorizationClockRecovery.objects.exists())
+                self.assertFalse(ZoomRemovalOperation.objects.exists())
+                self.assertEqual(list(ZoomDeauthorizationTargetResolution.objects.values()), before)
+                retry = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", {**claims, "jti":str(uuid.uuid4())})
+                self.assertEqual(retry.status_code, 409, retry.content)
+                self.assertEqual(retry.json()["error"], "bound_event_result_expired")
+                transaction.set_rollback(True)
+
+    def test_deferred_recovery_exact_budget_and_original_horizon_boundary(self):
+        self.replace_grant_fixture(start_sample_error_ms=600)
+        claims = self._deferred_claims(event_at=self.now-72)
+        claims["client_receipt_clock_error_ms"] = 400
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+        self.assertEqual(response.status_code, 200, response.content)
+        snapshot = ZoomDeauthorizationEventBinding.objects.get().evidence_snapshot
+        self.assertEqual(snapshot["client_receipt_clock_error_ms"], 400)
+        self.assertEqual(snapshot["attendee_boundary_clock_error_ms"], [600, None])
+
+    def test_deferred_recovery_original_rejection_never_upgraded(self):
+        claims = self._deferred_claims()
+        for field in ("client_receipt_clock_error_ms", "client_clock_source_policy_id"):
+            with self.subTest(field=field):
+                bad = {**claims, field:None}
+                self._assert_recovery_refusal(bad, "recovery_receipt_unbounded")
+
+    def test_deferred_recovery_original_horizon_and_order(self):
+        claims = self._deferred_claims()
+        for delta in (30, 600):
+            self._assert_recovery_refusal({**claims, "zoom_event_at":claims["first_verified_at"]-delta}, "recovery_receipt_unbounded")
+        self._assert_recovery_refusal({**claims, "zoom_event_at":claims["zoom_request_signed_at"]+1}, "recovery_receipt_unbounded")
+        event = int(self.grant.generation_started_at.timestamp()) + 62
+        self._assert_recovery_refusal({**claims, "zoom_event_at":event, "zoom_request_signed_at":event, "first_verified_at":event}, "recovery_order_unproven")
+
+    def test_deferred_recovery_missing_start_and_budget(self):
+        self.replace_grant_fixture(start_sample_error_ms=600)
+        claims = self._deferred_claims()
+        self._assert_recovery_refusal({**claims, "client_receipt_clock_error_ms":401}, "recovery_budget_exceeded")
+        self._assert_recovery_refusal({**claims, "client_issuance_clock_error_ms":401}, "clock_untrusted")
+        self.grant.clock_samples.all().delete()
+        self._assert_recovery_refusal(claims, "recovery_start_unsampled")
+
+    def test_deferred_recovery_transient_issuance_can_retry(self):
+        self.replace_grant_fixture(start_sample_error_ms=600)
+        claims = self._deferred_claims()
+        original = list(ZoomDeauthorizationTargetResolution.objects.values())
+        for issuance in (None, 401):
+            self._assert_recovery_refusal({**claims, "client_issuance_clock_error_ms":issuance}, "clock_untrusted")
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", {**claims, "client_issuance_clock_error_ms":400})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(list(ZoomDeauthorizationTargetResolution.objects.values()), original)
+
+    def test_deferred_recovery_closed_or_incomplete_lineage_refuses(self):
+        for overrides, lineage in (({"legacy_history":True}, None), ({}, {"has_prior_grant":True}), ({}, {"history_complete":False}),
+                ({"live_connection":None, "generation_ended_at":datetime.fromtimestamp(self.now-10, tz=datetime_timezone.utc),
+                  "end_clock_health_id":"ended-test", "end_clock_error_ms":0, "end_clock_continuous":True}, None)):
+            with transaction.atomic():
+                self.replace_grant_fixture(lineage_overrides=lineage, **overrides)
+                if overrides.get("generation_ended_at"):
+                    ZoomOAuthConnection.objects.filter(pk=self.connection.pk).delete()
+                claims = self._deferred_claims()
+                self._assert_recovery_refusal(claims, "recovery_generation_changed")
+                transaction.set_rollback(True)
+            self.connection.refresh_from_db()
+            self.grant = ZoomOAuthAuthorizationGrant.objects.get(binding_id=self.grant.binding_id)
+            self.lineage = self.grant.lineage
+
+    def test_deferred_recovery_resolution_scope_mode_and_no_target_input(self):
+        claims = self._deferred_claims()
+        self._assert_recovery_refusal({**claims, "zoom_event_id":opaque_event_id()}, "recovery_resolution_ineligible")
+        self._assert_recovery_refusal({**claims, "binding_mode":CREATE_IF_FRESH}, "recovery_mode_invalid", 401)
+        self._assert_recovery_refusal({**claims, "grant_binding_id":str(self.grant.binding_id)}, "claims_schema_invalid", 401)
+        self._assert_recovery_refusal({**claims, "zoom_user_id":"different-user"}, "recovery_generation_changed")
+        before = self._recovery_rows()
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims, api_key=self.other_api_key)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(before, self._recovery_rows())
+        with override_settings(ENABLE_ZOOM_RETENTION_REMOVAL_API=False):
+            response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(before, self._recovery_rows())
+
+    def test_deferred_recovery_replay_projection_and_immutable_record(self):
+        claims = self._deferred_claims()
+        original = list(ZoomDeauthorizationTargetResolution.objects.values())
+        response = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+        self.assertEqual(response.status_code, 200, response.content)
+        replay = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+        self.assertEqual(replay.status_code, 409)
+        self.assertEqual(replay.json()["error"], "assertion_replayed")
+        for purpose, endpoint in ((RECOVER_PURPOSE, "recover"), (RESOLVE_PURPOSE, "resolve")):
+            retry = self.post_assertion("/api/v1/zoom_retention/deauthorization/"+endpoint, {**claims,"jti":str(uuid.uuid4()),"purpose":purpose})
+            self.assertEqual(retry.status_code, 200, retry.content)
+            self.assertEqual(retry.json(), response.json())
+            self.assertEqual(list(ZoomDeauthorizationTargetResolution.objects.values()), original)
+        self._assert_recovery_refusal({**claims, "jti":str(uuid.uuid4()), "first_verified_at":claims["first_verified_at"]+1}, "event_binding_conflict")
+        self.assertEqual(ZoomDeauthorizationClockRecovery.objects.count(), 1)
+        self.assertEqual(ZoomRemovalOperation.objects.count(), 1)
+        for action in (lambda: ZoomDeauthorizationClockRecovery.objects.update(evidence_digest="0"*64), lambda: ZoomDeauthorizationClockRecovery.objects.all().delete()):
+            with self.assertRaises(IntegrityError), transaction.atomic():
+                action()
+
+    def _deferred_reconnect(self):
+        token = {"access_token":"recovery-access-test", "refresh_token":"recovery-refresh-test", "scope":"user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token"}
+        user = {"id":self.connection.user_id, "account_id":self.connection.account_id,"status":"active"}
+        payload = {"zoom_oauth_app_binding":str(self.app_binding),"authorization_code":"recovery-reconnect-test","redirect_uri":"https://client-agent.test/reconnect"}
+        with patch("bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens",return_value=token), patch("bots.zoom_oauth_connections_api_utils._get_user_info", return_value=user):
+            return create_zoom_oauth_connection(payload,self.project)
+
+    def test_deferred_recovery_reconnect_before_recovery_refuses(self):
+        claims = self._deferred_claims()
+        replacement, error = self._deferred_reconnect()
+        self.assertIsNone(error)
+        self.assertNotEqual(replacement.authorization_generation, self.grant.authorization_generation)
+        self._assert_recovery_refusal(claims, "recovery_generation_changed")
+
+    def test_deferred_recovery_reconnect_race_preserves_replacement(self):
+        claims = self._deferred_claims()
+        entered, release, reconnect_started = Event(), Event(), Event()
+        reconnect_backend = []
+        def gated_evidence(*args):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("test recovery barrier timeout")
+            return _deferred_binding_evidence(*args)
+        def recover():
+            close_old_connections()
+            try:
+                return self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", claims)
+            finally:
+                close_old_connections()
+        def reconnect():
+            close_old_connections()
+            with django_db_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_backend_pid()")
+                reconnect_backend.append(cursor.fetchone()[0])
+            reconnect_started.set()
+            try:
+                return self._deferred_reconnect()
+            finally:
+                close_old_connections()
+        with patch("bots.zoom_deauthorization._deferred_binding_evidence",side_effect=gated_evidence), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(recover)
+            self.assertTrue(entered.wait(10))
+            second = pool.submit(reconnect)
+            self.assertTrue(reconnect_started.wait(10))
+            blocked = False
+            for _ in range(200):
+                with django_db_connection.cursor() as cursor:
+                    cursor.execute("SELECT cardinality(pg_blocking_pids(%s))", [reconnect_backend[0]])
+                    blocked = cursor.fetchone()[0] > 0
+                if blocked:
+                    break
+                release.wait(0.01)
+            self.assertTrue(blocked, "reconnect must wait on the recovery transaction's app/grant locks")
+            self.assertFalse(second.done())
+            release.set()
+            response = first.result(timeout=20)
+            replacement,error = second.result(timeout=20)
+        self.assertEqual(response.status_code,200,response.content)
+        self.assertIsNone(error)
+        result = response.json()
+        retry = self.post_assertion("/api/v1/zoom_retention/deauthorization/recover", {**claims, "jti":str(uuid.uuid4())})
+        self.assertEqual(retry.status_code, 200, retry.content)
+        self.assertEqual(retry.json(), result)
+        settlement = {key:value for key,value in claims.items() if key not in {"zoom_client_id","zoom_user_id","zoom_account_id"}}
+        settlement.update(purpose=SETTLE_PURPOSE,jti=str(uuid.uuid4()),**{key:result[key] for key in ("operation_id","grant_binding_id","connection_digest","connection_generation","temporal_evidence_digest","resolution_id")})
+        settled = self.post_assertion("/api/v1/zoom_retention/deauthorization",settlement)
+        self.assertEqual(settled.status_code,200,settled.content)
+        replacement.refresh_from_db()
+        self.assertNotEqual(replacement.authorization_generation,self.grant.authorization_generation)
+        self.assertTrue(ZoomOAuthConnection.objects.filter(pk=replacement.pk,authorization_generation=replacement.authorization_generation).exists())
 
 
 class ZoomDeauthorizationAuditKeyringMigrationTests(TransactionTestCase):
