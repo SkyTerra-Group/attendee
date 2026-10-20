@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -9,7 +10,7 @@ from unittest.mock import Mock, patch
 import requests
 from concurrency.exceptions import RecordModifiedError
 from django.core.exceptions import ValidationError
-from django.db import close_old_connections
+from django.db import close_old_connections, transaction
 from django.test import Client, TransactionTestCase, override_settings
 from django.utils import timezone
 
@@ -57,11 +58,11 @@ from bots.tasks.refresh_zoom_oauth_connection_task import refresh_zoom_oauth_con
 from bots.tasks.sync_zoom_oauth_connection_task import sync_zoom_oauth_connection
 from bots.tasks.validate_zoom_oauth_connections_task import validate_zoom_oauth_connections
 from bots.tests.zoom_log_capture import CaptureZoomLogBytes
-from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
 from bots.zoom_oauth_connections_utils import ZoomOAuthConnectionRemovalFenced, _get_access_token
 from bots.zoom_retention import (
     RECEIPT_RETENTION_DAYS,
     DatabaseVerificationError,
+    ExpectedGrantMismatch,
     OperationConflict,
     ProviderOutcome,
     StorageVerificationError,
@@ -73,6 +74,24 @@ from bots.zoom_retention import (
     process_connection_revoke,
     target_digest,
 )
+
+
+def expected_tuple(connection):
+    """Synthetic immutable-grant fixture for the pre-lineage retention tests.
+
+    These tests exercise token outcomes, not temporal/signed authority. Keep
+    their fixture history explicitly legacy/incomplete; never upgrade it.
+    """
+    from bots.models import ZoomOAuthAuthorizationGrant, ZoomOAuthAuthorizationLineage, ZoomRemovalAuditKeyFingerprint
+
+    grant = ZoomOAuthAuthorizationGrant.objects.filter(zoom_oauth_app=connection.zoom_oauth_app, authorization_generation=connection.authorization_generation).first()
+    if grant is None:
+        identity = hashlib.sha256(str(connection.authorization_generation).encode()).hexdigest()
+        fingerprint = hashlib.sha256(("synthetic-key:" + str(connection.zoom_oauth_app_id)).encode()).hexdigest()
+        ZoomRemovalAuditKeyFingerprint.objects.get_or_create(project=connection.zoom_oauth_app.project, zoom_oauth_app=connection.zoom_oauth_app, key_id="synthetic-test", defaults={"key_fingerprint": fingerprint})
+        lineage = ZoomOAuthAuthorizationLineage.objects.create(project=connection.zoom_oauth_app.project, zoom_oauth_app=connection.zoom_oauth_app, identity_digest=identity, identity_audit_key_id="synthetic-test", identity_audit_key_fingerprint=fingerprint, latest_grant_sequence=1, has_prior_grant=True, history_complete=False)
+        grant = ZoomOAuthAuthorizationGrant.objects.create(project=connection.zoom_oauth_app.project, zoom_oauth_app=connection.zoom_oauth_app, lineage=lineage, grant_sequence=1, live_connection=connection, connection_digest=hashlib.sha256(connection.object_id.encode()).hexdigest(), identity_digest=identity, identity_audit_key_id="synthetic-test", identity_audit_key_fingerprint=fingerprint, connection_audit_key_id="synthetic-test", connection_audit_key_fingerprint=fingerprint, authorization_generation=connection.authorization_generation, generation_started_at=timezone.now(), start_clock_health_id="synthetic-legacy-test", start_clock_continuous=False, legacy_history=True)
+    return dict(zoom_oauth_app_binding=connection.zoom_oauth_app.deauthorization_binding_id, grant_binding_id=grant.binding_id, authorization_generation=grant.authorization_generation)
 
 
 def response(status_code, payload):
@@ -160,6 +179,7 @@ class ZoomRetentionTests(TransactionTestCase):
                 operation_id=uuid.uuid4(),
                 connection_object_id=connection.object_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                **expected_tuple(connection),
             )
 
     def revoke_payload(self, connection, operation_id=None, source=ZoomRemovalOperationSources.SKYTERRA_INITIATED, project=None):
@@ -168,6 +188,7 @@ class ZoomRetentionTests(TransactionTestCase):
             "operation_id": str(operation_id or uuid.uuid4()),
             "connection_id": connection.object_id,
             "source": source,
+            **{key: str(value) for key, value in expected_tuple(connection).items()},
         }
 
     def purge_payload(self, *pairs, project=None):
@@ -385,6 +406,7 @@ class ZoomRetentionTests(TransactionTestCase):
             operation_id=operation_id,
             connection_object_id=connection.object_id,
             source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            **expected_tuple(connection),
         )
         self.assertEqual(first.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         connection.refresh_from_db()
@@ -398,6 +420,7 @@ class ZoomRetentionTests(TransactionTestCase):
             operation_id=operation_id,
             connection_object_id=connection.object_id,
             source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            **expected_tuple(connection),
         )
         self.assertEqual(second.state, ZoomRemovalOperationStates.REVOKED)
         post.assert_called_once()
@@ -414,6 +437,7 @@ class ZoomRetentionTests(TransactionTestCase):
             operation_id=operation_id,
             connection_object_id=connection.object_id,
             source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            **expected_tuple(connection),
         )
 
         post.reset_mock()
@@ -424,6 +448,7 @@ class ZoomRetentionTests(TransactionTestCase):
             operation_id=operation_id,
             connection_object_id=connection.object_id,
             source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+            **expected_tuple(connection),
         )
         self.assertEqual(replay.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         connection.refresh_from_db()
@@ -663,6 +688,7 @@ class ZoomRetentionTests(TransactionTestCase):
                 operation_id=operation_id,
                 connection_object_id=old_connection.object_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                **expected_tuple(old_connection),
             )
         self.assertEqual(first.state, ZoomRemovalOperationStates.REVOKE_UNKNOWN)
         old_generation = old_connection.authorization_generation
@@ -672,44 +698,33 @@ class ZoomRetentionTests(TransactionTestCase):
                 operation_id=uuid.uuid4(),
                 connection_object_id=old_connection.object_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                **expected_tuple(old_connection),
             )
         self.assertEqual(duplicate_conflict.exception.canonical_operation_id, operation_id)
 
-        with (
-            patch(
-                "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens",
-                return_value={
-                    "access_token": "replacement-access",
-                    "refresh_token": "replacement-refresh",
-                    "scope": "user:read:user user:read:zak meeting:read:list_meetings meeting:read:local_recording_token",
-                },
-            ),
-            patch(
-                "bots.zoom_oauth_connections_api_utils._get_user_info",
-                return_value={
-                    "id": old_connection.user_id,
-                    "account_id": "replacement-account",
-                    "status": "active",
-                },
-            ),
-        ):
-            replacement, error = create_zoom_oauth_connection(
-                {
-                    "zoom_oauth_app_id": self.zoom_app.object_id,
-                    "authorization_code": "fresh-code",
-                    "redirect_uri": "https://example.com/oauth/callback",
-                },
-                self.project,
-            )
-        self.assertIsNone(error)
+        # Synthetic fixture replacement for this legacy dedupe test; the
+        # exact-capture callback is exercised by the expected-grant tests.
+        with transaction.atomic():
+            grant = old_connection.authorization_grant
+            grant.generation_ended_at = timezone.now()
+            grant.end_clock_health_id = "synthetic-legacy-test"
+            grant.end_clock_error_ms = 0
+            grant.end_clock_continuous = False
+            grant.live_connection = None
+            grant.save()
+            replacement = ZoomOAuthConnection.objects.select_for_update().get(pk=old_connection.pk)
+            replacement.state = ZoomOAuthConnectionStates.CONNECTED
+            replacement.replace_authorization_credentials({"refresh_token": "replacement-refresh"})
+        expected_tuple(replacement)
         self.assertEqual(replacement.pk, old_connection.pk)
         self.assertNotEqual(replacement.authorization_generation, old_generation)
-        with self.assertRaises(OperationConflict):
+        with self.assertRaises(ExpectedGrantMismatch):
             process_connection_revoke(
                 project=self.project,
                 operation_id=operation_id,
                 connection_object_id=replacement.object_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                **expected_tuple(replacement),
             )
         replacement.refresh_from_db()
         self.assertEqual(replacement.state, ZoomOAuthConnectionStates.CONNECTED)
@@ -722,6 +737,7 @@ class ZoomRetentionTests(TransactionTestCase):
                 operation_id=fresh_operation_id,
                 connection_object_id=replacement.object_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                **expected_tuple(replacement),
             )
         self.assertEqual(fresh_removal.state, ZoomRemovalOperationStates.REVOKED)
         self.assertEqual(fresh_removal.target_generation, replacement.authorization_generation)

@@ -50,6 +50,7 @@ from bots.models import (
     ZoomDeauthorizationEventBinding,
     ZoomDeauthorizationResolutionOutcomes,
     ZoomDeauthorizationTargetResolution,
+    ZoomOAuthApp,
     ZoomOAuthAuthorizationGrant,
     ZoomOAuthConnection,
     ZoomOAuthConnectionStates,
@@ -78,6 +79,10 @@ _COMPLETED_STATES = {
 
 class CrossProjectTarget(Exception):
     pass
+
+
+class ExpectedGrantMismatch(Exception):
+    """The caller did not name the exact immutable grant being removed."""
 
 
 class OperationConflict(Exception):
@@ -633,12 +638,48 @@ def _revoke_at_zoom(connection: ZoomOAuthConnection) -> ProviderOutcome:
     return ProviderOutcome(False, "revoke_unrecognized_response")
 
 
+def _admit_connection_revoke(*, project, operation_id, connection_object_id, source, zoom_oauth_app_binding, grant_binding_id, authorization_generation):
+    """Bind admission/idempotency before touching credentials or remote state.
+
+    App/grant/connection locks match callback ordering. They cover admission,
+    not provider I/O: the existing captured-token and generation fences still
+    protect a replacement that commits after this transaction.
+    """
+    try:
+        app_binding, grant_binding, generation = (uuid.UUID(str(value)) for value in (zoom_oauth_app_binding, grant_binding_id, authorization_generation))
+    except (ValueError, TypeError, AttributeError):
+        raise ExpectedGrantMismatch() from None
+    with transaction.atomic():
+        app = ZoomOAuthApp.objects.select_for_update().filter(project=project, deauthorization_binding_id=app_binding).first()
+        if app is None:
+            raise ExpectedGrantMismatch()
+        grant = ZoomOAuthAuthorizationGrant.objects.select_for_update().filter(project=project, zoom_oauth_app=app, binding_id=grant_binding, authorization_generation=generation).first()
+        if grant is None:
+            raise ExpectedGrantMismatch()
+        _lock_identifier(project.pk, operation_id)
+        existing = get_project_operation(project, operation_id)
+        if existing is not None:
+            if existing.operation_type != ZoomRemovalOperationTypes.REVOKE_CONNECTION or existing.authorization_grant_id != grant.pk or existing.target_generation != generation or existing.target_digest != target_digest(project, ZoomRemovalOperationTypes.REVOKE_CONNECTION, connection_object_id):
+                raise ExpectedGrantMismatch()
+            # A same-tuple terminal replay remains readable after its exact
+            # connection has gone; it must never adopt a replacement.
+            if existing.state in _COMPLETED_STATES:
+                return existing
+        current = ZoomOAuthConnection.objects.select_for_update().filter(pk=grant.live_connection_id, object_id=connection_object_id, zoom_oauth_app=app, authorization_generation=generation).first()
+        if current is None or grant.generation_ended_at is not None:
+            raise ExpectedGrantMismatch()
+        return _get_or_create_operation(project=project, operation_id=operation_id, operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION, target_object_id=connection_object_id, source=source, target_generation=generation, authorization_grant=grant)
+
+
 def process_connection_revoke(
     *,
     project: Project,
     operation_id: uuid.UUID,
     connection_object_id: str,
     source: str,
+    zoom_oauth_app_binding=None,
+    grant_binding_id=None,
+    authorization_generation=None,
 ) -> ZoomRemovalOperation:
     if source != ZoomRemovalOperationSources.SKYTERRA_INITIATED:
         # A normal project API credential cannot attest a signed Zoom event.
@@ -648,25 +689,14 @@ def process_connection_revoke(
     if _target_exists_in_other_project(ZoomOAuthConnection, project, connection_object_id, "zoom_oauth_app__project"):
         raise CrossProjectTarget()
 
-    initial_connection = ZoomOAuthConnection.objects.select_related("zoom_oauth_app").filter(
-        object_id=connection_object_id,
-        zoom_oauth_app__project=project,
-    ).first()
-    authorization_grant = None
-    if initial_connection is not None:
-        try:
-            authorization_grant = initial_connection.authorization_grant
-        except ZoomOAuthAuthorizationGrant.DoesNotExist:
-            authorization_grant = None
-
-    operation = _get_or_create_operation(
+    operation = _admit_connection_revoke(
         project=project,
         operation_id=operation_id,
-        operation_type=ZoomRemovalOperationTypes.REVOKE_CONNECTION,
-        target_object_id=connection_object_id,
+        connection_object_id=connection_object_id,
         source=source,
-        target_generation=initial_connection.authorization_generation if initial_connection else None,
-        authorization_grant=authorization_grant,
+        zoom_oauth_app_binding=zoom_oauth_app_binding,
+        grant_binding_id=grant_binding_id,
+        authorization_generation=authorization_generation,
     )
     operation, lease_token = _claim_operation(operation)
     if lease_token is None:

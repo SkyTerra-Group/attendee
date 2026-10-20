@@ -110,7 +110,7 @@ class ZoomRemovalLeaseExpiryTests(TransactionTestCase):
             return retention.ProviderOutcome(True)
 
         with patch("bots.zoom_retention.timezone.now", side_effect=lambda: clock[0]), patch.object(retention, "_revoke_at_zoom", side_effect=revoke):
-            result = retention.process_connection_revoke(project=self.project, operation_id=uuid.uuid4(), connection_object_id=connection.object_id, source=ZoomRemovalOperationSources.SKYTERRA_INITIATED)
+            result = retention.process_connection_revoke(project=self.project, operation_id=uuid.uuid4(), connection_object_id=connection.object_id, source=ZoomRemovalOperationSources.SKYTERRA_INITIATED, **fixtures.expected_tuple(connection))
         self.assertIsNone(result.completed_at)
         self.assertIsNotNone(result.target_object_id)
         self.assertTrue(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())
@@ -126,7 +126,7 @@ class ZoomRemovalLeaseExpiryTests(TransactionTestCase):
             return result
 
         with patch("bots.zoom_retention.timezone.now", side_effect=lambda: clock[0]), patch.object(retention, "_revoke_at_zoom", return_value=retention.ProviderOutcome(True)), patch.object(ZoomOAuthConnection, "delete", new=delete_then_expire):
-            result = retention.process_connection_revoke(project=self.project, operation_id=uuid.uuid4(), connection_object_id=connection.object_id, source=ZoomRemovalOperationSources.SKYTERRA_INITIATED)
+            result = retention.process_connection_revoke(project=self.project, operation_id=uuid.uuid4(), connection_object_id=connection.object_id, source=ZoomRemovalOperationSources.SKYTERRA_INITIATED, **fixtures.expected_tuple(connection))
         self.assertIsNone(result.completed_at)
         self.assertIsNotNone(result.target_object_id)
         self.assertTrue(ZoomOAuthConnection.objects.filter(pk=connection.pk).exists())

@@ -1440,6 +1440,9 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 operation_id=canonical,
                 connection_object_id=connection_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                zoom_oauth_app_binding=self.app_binding,
+                grant_binding_id=self.grant.binding_id,
+                authorization_generation=self.grant.authorization_generation,
             )
         self.assertEqual(provider_result.terminal_basis, "provider_revoke")
         provider.assert_called_once()
@@ -1533,6 +1536,9 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 operation_id=signed_canonical,
                 connection_object_id=connection_id,
                 source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                zoom_oauth_app_binding=self.app_binding,
+                grant_binding_id=self.grant.binding_id,
+                authorization_generation=self.grant.authorization_generation,
             )
         self.assertEqual(str(signed_canonical), str(replay.identifiers.get(role="canonical").identifier_uuid))
         self.assertEqual(replay.terminal_basis, "signed_zoom_deauthorization")
