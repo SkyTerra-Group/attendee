@@ -420,15 +420,35 @@ class ZoomOAuthConnection(models.Model):
         decrypted_data = f.decrypt(bytes(self._encrypted_data))
         return json.loads(decrypted_data.decode())
 
+    def _check_persisted_fence(self, persisted, authorization_replacement):
+        if persisted["authorization_generation"] != self.authorization_generation and not authorization_replacement:
+            raise ValidationError("Zoom OAuth authorization generation is immutable")
+        if persisted["state"] == ZoomOAuthConnectionStates.REMOVING and self.state != ZoomOAuthConnectionStates.REMOVING and not authorization_replacement:
+            raise ValidationError("Zoom OAuth connection removal fence is active")
+
     def save(self, *args, **kwargs):
         authorization_replacement = kwargs.pop("_authorization_replacement", False)
+        if self.pk and not self._state.adding:
+            # A loaded instance may only UPDATE its own live row. Django's
+            # UPDATE-then-INSERT fallback would otherwise re-create a row (and
+            # its credentials) that a purge or revoke deleted after this
+            # instance was read. The row lock serializes the fence check with
+            # the purge's own select_for_update + delete.
+            with transaction.atomic(using=kwargs.get("using") or self._state.db):
+                persisted = type(self).objects.select_for_update().filter(pk=self.pk).values("state", "authorization_generation").first()
+                if persisted is None:
+                    raise ValidationError("Zoom OAuth connection no longer exists")
+                self._check_persisted_fence(persisted, authorization_replacement)
+                if not self.object_id:
+                    self.object_id = f"{self.OBJECT_ID_PREFIX}{''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))}"
+                if not kwargs.get("force_insert"):
+                    kwargs["force_update"] = True
+                super().save(*args, **kwargs)
+            return
         if self.pk:
             persisted = type(self).objects.filter(pk=self.pk).values("state", "authorization_generation").first()
             if persisted:
-                if persisted["authorization_generation"] != self.authorization_generation and not authorization_replacement:
-                    raise ValidationError("Zoom OAuth authorization generation is immutable")
-                if persisted["state"] == ZoomOAuthConnectionStates.REMOVING and self.state != ZoomOAuthConnectionStates.REMOVING and not authorization_replacement:
-                    raise ValidationError("Zoom OAuth connection removal fence is active")
+                self._check_persisted_fence(persisted, authorization_replacement)
         if not self.object_id:
             # Generate a random 16-character string
             random_string = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))

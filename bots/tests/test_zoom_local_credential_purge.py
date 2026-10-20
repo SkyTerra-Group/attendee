@@ -278,3 +278,94 @@ class LocalCredentialPurgeTests(TransactionTestCase):
         self.assertEqual(replacement.get_credentials(),{'refresh_token':'recovery-refresh-test'})
         self.assertNotEqual(replacement.authorization_generation,self.grant.authorization_generation)
         self.assertNotEqual(replacement.pk,self.connection.pk)
+
+    # A pre-purge instance (as held by run_scheduler's loops) must never
+    # re-insert the purged row through Django's UPDATE-then-INSERT fallback.
+    def purge_with_receipt(self):
+        payload = self.payload()
+        response = self.post(payload)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assert_proof(response.json())
+        return payload['operation_id']
+
+    def assert_still_purged(self, operation_id):
+        self.assertFalse(ZoomOAuthConnection.objects.filter(pk=self.connection.pk).exists())
+        self.assertFalse(ZoomOAuthConnection.objects.filter(authorization_generation=self.grant.authorization_generation).exists())
+        receipt = self.client.get(f'/api/v1/zoom_retention/operations/{operation_id}', HTTP_AUTHORIZATION='Token '+self.api_key)
+        self.assert_proof(receipt.json())
+
+    def test_stale_refresh_enqueue_after_purge_does_not_resurrect_credentials(self):
+        from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
+        stale = ZoomOAuthConnection.objects.get(pk=self.connection.pk)
+        self.assertTrue(stale.get_credentials())
+        operation_id = self.purge_with_receipt()
+        with patch('bots.tasks.refresh_zoom_oauth_connection_task.refresh_zoom_oauth_connection.delay') as delay:
+            enqueue_refresh_zoom_oauth_connection_task(stale)
+        delay.assert_not_called()
+        self.assert_still_purged(operation_id)
+
+    def test_stale_sync_enqueue_after_purge_does_not_resurrect_credentials(self):
+        from bots.tasks.sync_zoom_oauth_connection_task import enqueue_sync_zoom_oauth_connection_task
+        stale = ZoomOAuthConnection.objects.get(pk=self.connection.pk)
+        operation_id = self.purge_with_receipt()
+        with patch('bots.tasks.sync_zoom_oauth_connection_task.sync_zoom_oauth_connection.delay') as delay:
+            enqueue_sync_zoom_oauth_connection_task(stale)
+        delay.assert_not_called()
+        self.assert_still_purged(operation_id)
+
+    def test_stale_plain_save_after_purge_is_refused(self):
+        from django.core.exceptions import ValidationError
+        stale = ZoomOAuthConnection.objects.get(pk=self.connection.pk)
+        operation_id = self.purge_with_receipt()
+        for save in (stale.save, lambda: stale.set_credentials({'refresh_token': 'stale'})):
+            with self.assertRaises(ValidationError):
+                save()
+        self.assert_still_purged(operation_id)
+
+    def test_live_enqueue_and_save_still_update_the_row(self):
+        from bots.tasks.refresh_zoom_oauth_connection_task import enqueue_refresh_zoom_oauth_connection_task
+        stale = ZoomOAuthConnection.objects.get(pk=self.connection.pk)
+        with patch('bots.tasks.refresh_zoom_oauth_connection_task.refresh_zoom_oauth_connection.delay') as delay:
+            enqueue_refresh_zoom_oauth_connection_task(stale)
+        delay.assert_called_once_with(self.connection.pk)
+        self.connection.refresh_from_db()
+        self.assertIsNotNone(self.connection.token_refresh_task_enqueued_at)
+        self.connection.set_credentials({'refresh_token': 'rotated'})
+        self.connection.refresh_from_db()
+        self.assertEqual(self.connection.get_credentials(), {'refresh_token': 'rotated'})
+        self.assertEqual(ZoomOAuthConnection.objects.filter(pk=self.connection.pk).count(), 1)
+
+    def test_stale_save_racing_purge_waits_for_row_lock_then_is_refused(self):
+        from django.core.exceptions import ValidationError
+        stale = ZoomOAuthConnection.objects.get(pk=self.connection.pk)
+        entered, release = Event(), Event()
+        original_delete = ZoomOAuthConnection.delete
+        def paused_delete(instance, *args, **kwargs):
+            result = original_delete(instance, *args, **kwargs)
+            entered.set()
+            self.assertTrue(release.wait(10))
+            return result
+        payload = self.payload()
+        def purge():
+            close_old_connections()
+            try: return self.call(payload)
+            finally: close_old_connections()
+        def stale_save():
+            close_old_connections()
+            try:
+                stale.save()
+                return None
+            except ValidationError as error:
+                return error
+            finally: close_old_connections()
+        with patch.object(ZoomOAuthConnection, 'delete', new=paused_delete), ThreadPoolExecutor(max_workers=2) as pool:
+            deleting = pool.submit(purge)
+            try:
+                self.assertTrue(entered.wait(10))
+                saving = pool.submit(stale_save)
+                with self.assertRaises(Exception):
+                    saving.result(1)  # blocked on the purge's row lock
+            finally: release.set()
+            self.assertEqual(deleting.result(15).state, 'purged')
+            self.assertIsInstance(saving.result(15), ValidationError)
+        self.assert_still_purged(payload['operation_id'])

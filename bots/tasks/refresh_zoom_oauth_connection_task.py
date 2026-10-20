@@ -22,10 +22,18 @@ from celery import shared_task
 def enqueue_refresh_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConnection):
     """Enqueue a refresh zoom oauth connection task for a zoom oauth connection."""
 
+    # Write only the scheduling fields on the locked live row: a stale
+    # scheduler instance must never re-save (or re-insert) purged credentials.
     with transaction.atomic():
-        zoom_oauth_connection.token_refresh_task_enqueued_at = timezone.now()
+        try:
+            current = update_zoom_oauth_connection_if_writable(
+                zoom_oauth_connection, token_refresh_task_enqueued_at=timezone.now(), token_refresh_task_requested_at=None,
+            )
+        except ZoomOAuthConnectionRemovalFenced:
+            logger.info("zoom_oauth_refresh_skipped code=removal_fenced")
+            return
+        zoom_oauth_connection.token_refresh_task_enqueued_at = current.token_refresh_task_enqueued_at
         zoom_oauth_connection.token_refresh_task_requested_at = None
-        zoom_oauth_connection.save()
         refresh_zoom_oauth_connection.delay(zoom_oauth_connection.id)
 
 

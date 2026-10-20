@@ -29,10 +29,18 @@ def enqueue_sync_zoom_oauth_connection_task(zoom_oauth_connection: ZoomOAuthConn
         logger.info("zoom_oauth_sync_skipped code=capability_disabled")
         return
 
+    # Write only the scheduling fields on the locked live row: a stale
+    # scheduler instance must never re-save (or re-insert) purged credentials.
     with transaction.atomic():
-        zoom_oauth_connection.sync_task_enqueued_at = timezone.now()
+        try:
+            current = update_zoom_oauth_connection_if_writable(
+                zoom_oauth_connection, sync_task_enqueued_at=timezone.now(), sync_task_requested_at=None,
+            )
+        except ZoomOAuthConnectionRemovalFenced:
+            logger.info("zoom_oauth_sync_skipped code=removal_fenced")
+            return
+        zoom_oauth_connection.sync_task_enqueued_at = current.sync_task_enqueued_at
         zoom_oauth_connection.sync_task_requested_at = None
-        zoom_oauth_connection.save()
         sync_zoom_oauth_connection.delay(zoom_oauth_connection.id)
 
 
