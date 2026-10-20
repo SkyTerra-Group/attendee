@@ -200,6 +200,21 @@ def operation_result(operation: ZoomRemovalOperation) -> dict:
                     "grant_history_complete": snapshot["history_complete"],
                 }
             )
+    if operation.operation_type == ZoomRemovalOperationTypes.PURGE_CONNECTION_CREDENTIALS:
+        # This receipt attests only committed local database erasure. It never
+        # imports evidence from another operation on the same authorization.
+        if operation.authorization_grant_id is None or binding is not None or operation.provider_revoke_settled_at is not None or operation.signed_deauthorization_settled_at is not None:
+            raise DatabaseVerificationError()
+        result["evidence"]["local_credential_erasure"] = (
+            operation.state == ZoomRemovalOperationStates.PURGED
+            and operation.phase == ZoomRemovalOperationPhases.COMPLETE
+            and operation.terminal_basis is None
+            and operation.completed_at is not None
+        )
+        # Keep the original remote/signed CHECK and stored NULL basis intact.
+        # Only this separately constrained completed type gains a local basis.
+        if result["evidence"]["local_credential_erasure"]:
+            result["terminal_basis"] = "local_credential_erasure"
     return result
 
 
@@ -281,7 +296,7 @@ def _get_or_create_operation(
             return False
         if authorization_grant is not None and candidate.authorization_grant_id != authorization_grant.pk:
             return False
-        if operation_type == ZoomRemovalOperationTypes.REVOKE_CONNECTION and target_generation is not None:
+        if operation_type in (ZoomRemovalOperationTypes.REVOKE_CONNECTION, ZoomRemovalOperationTypes.PURGE_CONNECTION_CREDENTIALS) and target_generation is not None:
             return candidate.target_generation == target_generation
         return True
 
@@ -328,7 +343,7 @@ def _get_or_create_operation(
                 else None
             ),
         )
-        if authorization_grant and authorization_grant.canonical_removal_operation_id is None:
+        if authorization_grant and operation_type != ZoomRemovalOperationTypes.PURGE_CONNECTION_CREDENTIALS and authorization_grant.canonical_removal_operation_id is None:
             authorization_grant.canonical_removal_operation = operation
             authorization_grant.save(update_fields=["canonical_removal_operation", "updated_at"])
         return operation
@@ -780,6 +795,85 @@ def process_connection_revoke(
         return ZoomRemovalOperation.objects.get(pk=operation.pk)
     except Exception:
         return _release_claim(operation.pk, lease_token, state=ZoomRemovalOperationStates.REVOKE_UNKNOWN, failure_code="local_revoke_finalize_failed")
+
+
+def process_local_credential_purge(
+    *, project, operation_id, connection_object_id, source,
+    zoom_oauth_app_binding=None, grant_binding_id=None, authorization_generation=None,
+):
+    """Erase only exact stored credentials; never assert remote revocation.
+
+    No remote I/O or asynchronous lease is involved. Admission, erasure and
+    receipt share one transaction and the callback's app-first lock order.
+    Unproved historical absence is refused; only our own committed proof replays.
+    """
+    if not getattr(settings, "ENABLE_ZOOM_LOCAL_CREDENTIAL_PURGE", False):
+        raise UntrustedDeauthorizationSource()
+    if source != ZoomRemovalOperationSources.SKYTERRA_INITIATED:
+        raise UntrustedDeauthorizationSource()
+    if _target_exists_in_other_project(ZoomOAuthConnection, project, connection_object_id, "zoom_oauth_app__project"):
+        raise CrossProjectTarget()
+    try:
+        app_binding, grant_binding, generation = (uuid.UUID(str(value)) for value in (zoom_oauth_app_binding, grant_binding_id, authorization_generation))
+    except (ValueError, TypeError, AttributeError):
+        raise ExpectedGrantMismatch() from None
+    from bots.zoom_deauthorization_readiness import DeauthorizationReadinessError, _validate_schema
+    try:
+        _validate_schema()
+    except DeauthorizationReadinessError:
+        raise DatabaseVerificationError() from None
+    kind = ZoomRemovalOperationTypes.PURGE_CONNECTION_CREDENTIALS
+    with transaction.atomic():
+        app = ZoomOAuthApp.objects.select_for_update().filter(project=project, deauthorization_binding_id=app_binding).first()
+        if app is None:
+            raise ExpectedGrantMismatch()
+        grant = ZoomOAuthAuthorizationGrant.objects.select_for_update().filter(project=project, zoom_oauth_app=app, binding_id=grant_binding, authorization_generation=generation).first()
+        if grant is None:
+            raise ExpectedGrantMismatch()
+        _lock_identifier(project.pk, operation_id)
+        existing = get_project_operation(project, operation_id)
+        if existing is not None:
+            if existing.operation_type != kind or existing.authorization_grant_id != grant.pk or existing.target_generation != generation or existing.target_digest != target_digest(project, kind, connection_object_id):
+                raise ExpectedGrantMismatch()
+            if existing.state == ZoomRemovalOperationStates.PURGED:
+                if not operation_result(existing)["evidence"]["local_credential_erasure"]:
+                    raise DatabaseVerificationError()
+                return existing
+        # Recognize a committed proof under another proposed UUID without
+        # requiring a now-deleted connection, but never adopt another tuple.
+        own = ZoomRemovalOperation.objects.filter(project=project, operation_type=kind, authorization_grant=grant).first()
+        if own is not None and own.target_digest == target_digest(project, kind, connection_object_id):
+            raise OperationConflict(canonical_operation_id(own))
+        current = ZoomOAuthConnection.objects.select_for_update().filter(
+            pk=grant.live_connection_id, object_id=connection_object_id,
+            zoom_oauth_app=app, authorization_generation=generation,
+        ).first()
+        if current is None or grant.generation_ended_at is not None:
+            raise ExpectedGrantMismatch()
+        operation = _get_or_create_operation(
+            project=project, operation_id=operation_id, operation_type=kind,
+            target_object_id=connection_object_id, source=source,
+            target_generation=generation, authorization_grant=grant,
+        )
+        connection_pk = current.pk
+        attempts = WebhookDeliveryAttempt.objects.filter(zoom_oauth_connection_id=connection_pk)
+        attempt_ids = list(attempts.values_list("pk", flat=True))
+        attempts.delete()
+        current.delete()
+        # Verify both exact connection absence and that SET NULL did not
+        # silently retain any of the delivery rows selected for erasure.
+        if (ZoomOAuthConnection.objects.filter(pk=connection_pk).exists()
+                or ZoomOAuthConnection.objects.filter(zoom_oauth_app=app, authorization_generation=generation).exists()
+                or WebhookDeliveryAttempt.objects.filter(pk__in=attempt_ids).exists()):
+            raise DatabaseVerificationError()
+        now = timezone.now()
+        operation.state = ZoomRemovalOperationStates.PURGED
+        operation.phase = ZoomRemovalOperationPhases.COMPLETE
+        operation.target_object_id = None
+        operation.completed_at = now
+        operation.expires_at = now + timedelta(days=RECEIPT_RETENTION_DAYS)
+        operation.save()
+        return operation
 
 
 def _storage_manifest(bot: Bot) -> dict:

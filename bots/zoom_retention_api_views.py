@@ -28,6 +28,7 @@ from .zoom_deauthorization_grants import database_clock_now
 from .zoom_retention import (
     MAX_PURGE_TARGETS,
     CrossProjectTarget,
+    DatabaseVerificationError,
     ExpectedGrantMismatch,
     OperationConflict,
     UntrustedDeauthorizationSource,
@@ -35,6 +36,7 @@ from .zoom_retention import (
     operation_result,
     process_bot_purge,
     process_connection_revoke,
+    process_local_credential_purge,
 )
 
 
@@ -167,6 +169,47 @@ class ZoomConnectionRevokeView(GenericAPIView):
                 source=source,
                 **expected,
             )
+        except CrossProjectTarget:
+            return Response({"error": "scope_not_found"}, status=status.HTTP_404_NOT_FOUND)
+        except ExpectedGrantMismatch:
+            return Response({"error": "grant_mismatch"}, status=status.HTTP_409_CONFLICT)
+        except OperationConflict as error:
+            return _safe_conflict_response(error)
+        except UntrustedDeauthorizationSource:
+            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(operation_result(operation), status=status.HTTP_200_OK)
+
+
+class ZoomLocalCredentialPurgeView(GenericAPIView):
+    authentication_classes = [ApiKeyAuthentication]
+    throttle_classes = [ProjectPostThrottle]
+
+    def post(self, request):
+        _require_enabled()
+        if not getattr(settings, "ENABLE_ZOOM_LOCAL_CREDENTIAL_PURGE", False):
+            raise Http404
+        if not _scope_is_valid(request):
+            return Response({"error": "scope_not_found"}, status=status.HTTP_404_NOT_FOUND)
+
+        operation_id = _uuid(request.data.get("operation_id"))
+        connection_id = request.data.get("connection_id")
+        source = request.data.get("source")
+        expected = {key: _uuid(request.data.get(key)) for key in ("zoom_oauth_app_binding", "grant_binding_id", "authorization_generation")}
+        if any(value is None for value in expected.values()):
+            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
+        if operation_id is None or not _valid_target_id(connection_id, "zoc_") or source != ZoomRemovalOperationSources.SKYTERRA_INITIATED:
+            return Response({"error": "invalid_request"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            operation = process_local_credential_purge(
+                project=request.auth.project,
+                operation_id=operation_id,
+                connection_object_id=connection_id,
+                source=source,
+                **expected,
+            )
+        except DatabaseVerificationError:
+            return Response({"error": "local_erasure_unproved"}, status=status.HTTP_409_CONFLICT)
         except CrossProjectTarget:
             return Response({"error": "scope_not_found"}, status=status.HTTP_404_NOT_FOUND)
         except ExpectedGrantMismatch:

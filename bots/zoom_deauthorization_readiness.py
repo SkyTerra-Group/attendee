@@ -51,6 +51,7 @@ _REQUIRED_ROUTES = (
 )
 _REQUIRED_MIGRATIONS = {
     "0098_zoom_deauth_clock_recovery",
+    "0099_zoom_local_credential_purge",
     "0094_zoom_deauthorization_trust",
     "0095_zoom_deauth_operation_event_digest_consistency",
     "0096_zoom_deauth_audit_keyring_readiness",
@@ -59,6 +60,7 @@ _REQUIRED_MIGRATIONS = {
 # initially-deferred, UPDATE-OF columns).  This prevents an enabled same-name
 # no-op or INSERT/UPDATE-only replacement from satisfying readiness.
 _REQUIRED_TRIGGERS = {
+    ("bots_zoomremovaloperation", "zoom_local_erasure_receipt_immutable"): (19, "bots_zoom_local_erasure_receipt_immutable", "9f0f6b40bc808949f160b476aaa173609ef426b923951104d46622ac33c7195c", False, False, False, ()),
     ("bots_zoomdeauthorizationclockrecovery", "zoom_deauth_clock_recovery_immutable"): (31, "bots_zoomdeauth_clock_recovery_immutable", "04c54fa3256a0397448afec87b8458ce4da0c7b937082dbcea1513a67793e737", False, False, False, ()),
     ("bots_zoomoauthauthorizationgrantclocksample", "zoom_deauth_grant_clock_sample_immutable"): (23, "bots_zoomdeauth_grant_clock_sample_immutable", "4bd4d8e86c71df217a708904028161ab4862a7afaa66d986db8bee5deff20607", False, False, False, ()),
     ("bots_zoomdeauthorizationassertionreceipt", "zoom_deauth_receipt_immutable"): (19, "bots_zoomdeauth_receipt_immutable", "c7f939d9c8727dcb57775a0972751dea9877a614ff10a6eef6378be9b46531b5", False, False, False, ()),
@@ -88,6 +90,7 @@ _REQUIRED_TRIGGERS = {
 # (constraint type, SHA-256(pg_get_constraintdef)).  Names are scoped to the
 # exact table so a same-name object elsewhere cannot satisfy readiness.
 _REQUIRED_CONSTRAINTS = {
+    ("bots_zoomremovaloperation", "zoom_local_purge_evidence_scope"): ("c", "bf5a8c04031145ffc79be212bde15cb036bc36a6d76ca3ceb4c79731f2a728b8"),
     ("bots_zoomdeauthorizationassertionreceipt", "unique_zoom_deauth_assertion_nonce"): ("u", "56266d47702665247f7fcef4f032bc5b9713fb7499e770961393a133bbe8026b"),
     ("bots_zoomdeauthorizationassertionreceipt", "zoom_assertion_receipt_target_matches_purpose"): ("c", "a4e2edca8a642e0f4c763c54cb0d19261eb8d231cc5d4bb0fe08b5a0f24bf2e3"),
     ("bots_zoomdeauthorizationeventbinding", "unique_zoom_deauthorization_event_binding"): ("u", "ca4ec0bede9e7b7495c96324b83143140ecdfd804c50ca45fe0a5db546c4aa50"),
@@ -116,6 +119,7 @@ _REQUIRED_CONSTRAINTS = {
 }
 
 _REQUIRED_INDEXES = {
+    ("bots_zoomremovaloperation", "unique_zoom_local_purge_grant"): "74d1bac91afa5cbac18a4b4e9ced35e4d4374fb21d84d6c803ac71aa69dc9be0",
     ("bots_zoomdeauthorizationeventbinding", "unique_zoom_deauthorization_binding_operation"): "7aa4a3f6b7a41f2693bb60aa5b831b03a86eacdb24ff5bc6514cf4b53cb3be9d",
     ("bots_zoomremovaloperation", "unique_zoom_purge_target_per_project"): "adbf56558da1faa3a1afb4621ba2cd569840f1c8d0b90e1bd3b33a06db4bd766",
     ("bots_zoomremovaloperation", "unique_zoom_revoke_authorization_grant"): "9e16e5efd2d7d1675b16fb292510718020a7c392e8c2fc043417f4707d6d942b",

@@ -54,6 +54,7 @@ CREDENTIALS_ENCRYPTION_KEY = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
 # The Zoom removal API is intentionally unreachable until the cross-service
 # retention flow has passed its integrated staging and wording gates.
 ENABLE_ZOOM_RETENTION_REMOVAL_API = os.getenv("ENABLE_ZOOM_RETENTION_REMOVAL_API", "false").lower() == "true"
+ENABLE_ZOOM_LOCAL_CREDENTIAL_PURGE = os.getenv("ENABLE_ZOOM_LOCAL_CREDENTIAL_PURGE", "false").lower() == "true"
 # Exact-app OAuth grant capture has its own false-default gate.  A caller
 # sending a binding while this is off is rejected instead of silently creating
 # history that later appears complete.

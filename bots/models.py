@@ -663,6 +663,7 @@ class ZoomRemovalAuditKeyFingerprint(models.Model):
 class ZoomRemovalOperationTypes(models.TextChoices):
     REVOKE_CONNECTION = "revoke_connection", "Revoke connection"
     PURGE_BOT = "purge_bot", "Purge bot"
+    PURGE_CONNECTION_CREDENTIALS = "purge_connection_credentials", "Purge local connection credentials"
 
 
 class ZoomRemovalOperationSources(models.TextChoices):
@@ -757,6 +758,11 @@ class ZoomRemovalOperation(models.Model):
                 condition=models.Q(verified_deauthorization_event_digest__isnull=False),
                 name="unique_zoom_verified_deauth_event",
             ),
+            models.UniqueConstraint(
+                fields=["project", "authorization_grant", "operation_type"],
+                condition=models.Q(operation_type=ZoomRemovalOperationTypes.PURGE_CONNECTION_CREDENTIALS),
+                name="unique_zoom_local_purge_grant",
+            ),
             models.CheckConstraint(
                 condition=(
                     models.Q(provider_revoke_settled_at__isnull=True, signed_deauthorization_settled_at__isnull=True, terminal_basis__isnull=True)
@@ -765,6 +771,20 @@ class ZoomRemovalOperation(models.Model):
                     | models.Q(provider_revoke_settled_at__isnull=False, signed_deauthorization_settled_at__isnull=False, terminal_basis="provider_and_signed")
                 ),
                 name="zoom_removal_terminal_basis_matches_evidence",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(operation_type=ZoomRemovalOperationTypes.PURGE_CONNECTION_CREDENTIALS)
+                    | (models.Q(source=ZoomRemovalOperationSources.SKYTERRA_INITIATED,
+                                authorization_grant__isnull=False, target_generation__isnull=False,
+                                zoom_oauth_app_binding__isnull=False, connection_digest__isnull=False,
+                                provider_revoke_settled_at__isnull=True, signed_deauthorization_settled_at__isnull=True,
+                                verified_deauthorization_event_digest__isnull=True, verified_deauthorization_at__isnull=True)
+                       & (models.Q(state="pending", phase="pending", terminal_basis__isnull=True, completed_at__isnull=True)
+                          | models.Q(state="purged", phase="complete", terminal_basis__isnull=True,
+                                     completed_at__isnull=False, target_object_id__isnull=True)))
+                ),
+                name="zoom_local_purge_evidence_scope",
             ),
             models.CheckConstraint(
                 condition=(
