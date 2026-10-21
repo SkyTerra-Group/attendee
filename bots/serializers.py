@@ -2401,5 +2401,7 @@ class ZoomOAuthConnectionSerializer(serializers.ModelSerializer):
             "updated_at",
             "last_successful_sync_at",
             "last_attempted_sync_at",
+            "last_attempted_token_refresh_at",
+            "last_successful_token_refresh_at",
         ]
         read_only_fields = fields

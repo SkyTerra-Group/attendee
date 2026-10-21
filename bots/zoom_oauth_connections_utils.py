@@ -1,12 +1,15 @@
 import hashlib
 import hmac
 import logging
+import time
 
 import requests
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NameResolutionError, NewConnectionError
 
-from attendee.logging import log_bounded_exception
+from attendee.logging import bounded_exception_metadata, log_bounded_exception
 from bots.meeting_url_utils import parse_zoom_join_url
 from bots.models import Bot, WebhookTriggerTypes, ZoomMeetingToZoomOAuthConnectionMapping, ZoomOAuthConnection, ZoomOAuthConnectionStates
 from bots.webhook_payloads import zoom_oauth_connection_webhook_payload
@@ -130,6 +133,169 @@ def _raise_if_error_is_authentication_error(e: requests.RequestException):
     return
 
 
+ZOOM_OAUTH_TOKEN_URL = "https://zoom.us/oauth/token"
+
+# SkyTerra: bounded transport retries on the token path. Attempt counts include the first request.
+ZOOM_TOKEN_REFRESH_MAX_ATTEMPTS = 3
+ZOOM_API_GET_MAX_ATTEMPTS = 3
+ZOOM_TRANSPORT_RETRY_BACKOFF_SECONDS = 1.0
+ZOOM_ROTATION_SAVE_RETRY_DELAY_SECONDS = 0.5
+
+# urllib3 raises these while opening the connection (DNS lookup or TCP connect),
+# before any byte of the request is written. NameResolutionError and
+# NewConnectionError subclass ConnectTimeoutError in urllib3 2.x; all three are
+# named so a change to that hierarchy cannot silently widen the set.
+_CONNECTION_NOT_ESTABLISHED_ERRORS = (NameResolutionError, NewConnectionError, ConnectTimeoutError)
+
+
+def _transport_retry_delay_seconds(failed_attempt: int) -> float:
+    """Exponential backoff after a failed attempt: 1 s after the first, 2 s after the second."""
+
+    return ZOOM_TRANSPORT_RETRY_BACKOFF_SECONDS * (2 ** (failed_attempt - 1))
+
+
+def _request_never_reached_zoom(error: BaseException) -> bool:
+    """True only when requests failed while opening the connection, before the request was sent.
+
+    requests reports those failures as ConnectionError (or its ConnectTimeout
+    subclass) wrapping urllib3's MaxRetryError, whose reason is the urllib3
+    connection error. Everything else may have reached Zoom and is never treated
+    as unsent: ReadTimeout, a ConnectionError wrapping ProtocolError ("Connection
+    aborted" once the request was written), SSL and proxy errors, and any response.
+    """
+
+    if not isinstance(error, requests.exceptions.ConnectionError):
+        return False
+    if isinstance(error, (requests.exceptions.SSLError, requests.exceptions.ProxyError)):
+        return False
+    if getattr(error, "response", None) is not None:
+        return False
+    reason = error.args[0] if error.args else None
+    if isinstance(reason, MaxRetryError):
+        reason = reason.reason
+    return isinstance(reason, _CONNECTION_NOT_ESTABLISHED_ERRORS)
+
+
+def _post_zoom_token_refresh(zoom_oauth_connection: ZoomOAuthConnection, data: dict) -> requests.Response:
+    """POST the refresh grant, resending only an attempt that never reached Zoom.
+
+    Zoom rotates the refresh token when it accepts this request. A request that
+    may have been received (read timeout, aborted connection, any HTTP response)
+    is never sent again: its outcome is unknown and a resend could spend the
+    chain. A request that failed in DNS resolution or connection setup was not
+    received, so the same refresh token is still current and safe to send again.
+    """
+
+    attempt = 1
+    while True:
+        try:
+            return requests.post(ZOOM_OAUTH_TOKEN_URL, data=data, timeout=30)
+        except requests.exceptions.ConnectionError as error:
+            if attempt >= ZOOM_TOKEN_REFRESH_MAX_ATTEMPTS or not _request_never_reached_zoom(error):
+                raise
+            exception_class, _ = bounded_exception_metadata(error)
+            logger.warning(
+                "zoom_oauth_refresh_retrying code=connection_not_established attempt=%s exception_class=%s",
+                attempt,
+                exception_class,
+            )
+        time.sleep(_transport_retry_delay_seconds(attempt))
+        # Removal may have begun while this attempt waited. Never send a refresh
+        # for a generation that is being removed.
+        _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
+        attempt += 1
+
+
+def _persist_rotated_refresh_token(zoom_oauth_connection: ZoomOAuthConnection, new_refresh_token: str) -> None:
+    """Save Zoom's rotated refresh token on the live, writable row, retrying one failed save.
+
+    The removal fence and the model's stale-save guard are refusals, not
+    failures: they propagate unchanged and are never retried.
+    """
+
+    attempt = 1
+    while True:
+        try:
+            with transaction.atomic():
+                current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
+                current_credentials = current.get_credentials() or {}
+                current_credentials["refresh_token"] = new_refresh_token
+                current.set_credentials(current_credentials)
+            return
+        except (ZoomOAuthConnectionRemovalFenced, ValidationError):
+            raise
+        except Exception as error:
+            if attempt >= 2:
+                log_bounded_exception(
+                    logger,
+                    "zoom_oauth_refresh_failed",
+                    "rotation_persist_failed",
+                    error,
+                )
+                raise ZoomAPIError("zoom_refresh_rotation_persist_failed") from None
+            exception_class, _ = bounded_exception_metadata(error)
+            logger.warning(
+                "zoom_oauth_refresh_rotation_save_retrying code=rotation_persist_retry exception_class=%s",
+                exception_class,
+            )
+        time.sleep(ZOOM_ROTATION_SAVE_RETRY_DELAY_SECONDS)
+        attempt += 1
+
+
+def _record_successful_token_refresh(zoom_oauth_connection: ZoomOAuthConnection) -> None:
+    """Stamp both refresh timestamps through the generation fence.
+
+    A removal fence propagates, as it would from the writability check that
+    follows. Any other failure to write these status fields is logged and does
+    not fail a refresh that Zoom accepted and whose rotation is already saved.
+    """
+
+    refreshed_at = timezone.now()
+    try:
+        update_zoom_oauth_connection_if_writable(
+            zoom_oauth_connection,
+            last_attempted_token_refresh_at=refreshed_at,
+            last_successful_token_refresh_at=refreshed_at,
+        )
+    except ZoomOAuthConnectionRemovalFenced:
+        raise
+    except Exception as error:
+        log_bounded_exception(
+            logger,
+            "zoom_oauth_refresh_status_write_failed",
+            "status_write_failed",
+            error,
+        )
+        return
+    zoom_oauth_connection.last_attempted_token_refresh_at = refreshed_at
+    zoom_oauth_connection.last_successful_token_refresh_at = refreshed_at
+
+
+def _record_failed_token_refresh_attempt(zoom_oauth_connection: ZoomOAuthConnection) -> None:
+    """Best effort: stamp last_attempted_token_refresh_at after Zoom refused or could not be reached.
+
+    Never raises, so the original refresh failure is what callers see.
+    """
+
+    attempted_at = timezone.now()
+    try:
+        update_zoom_oauth_connection_if_writable(
+            zoom_oauth_connection,
+            last_attempted_token_refresh_at=attempted_at,
+        )
+    except ZoomOAuthConnectionRemovalFenced:
+        return
+    except Exception as error:
+        log_bounded_exception(
+            logger,
+            "zoom_oauth_refresh_status_write_failed",
+            "status_write_failed",
+            error,
+        )
+        return
+    zoom_oauth_connection.last_attempted_token_refresh_at = attempted_at
+
+
 def _get_access_token(zoom_oauth_connection) -> str:
     """
     Exchange the stored refresh token for a new access token.
@@ -155,7 +321,7 @@ def _get_access_token(zoom_oauth_connection) -> str:
     }
 
     try:
-        response = requests.post("https://zoom.us/oauth/token", data=data, timeout=30)
+        response = _post_zoom_token_refresh(zoom_oauth_connection, data)
         response.raise_for_status()
         token_data = response.json()
 
@@ -166,17 +332,15 @@ def _get_access_token(zoom_oauth_connection) -> str:
         # IMPORTANT: Zoom rotates refresh tokens. Save the new one if provided.
         new_refresh = token_data.get("refresh_token")
         if new_refresh and new_refresh != refresh_token:
-            with transaction.atomic():
-                current = _locked_writable_zoom_oauth_connection(zoom_oauth_connection)
-                current_credentials = current.get_credentials() or {}
-                current_credentials["refresh_token"] = new_refresh
-                current.set_credentials(current_credentials)
+            _persist_rotated_refresh_token(zoom_oauth_connection, new_refresh)
             logger.info("zoom_oauth_refresh_rotated")
 
+        _record_successful_token_refresh(zoom_oauth_connection)
         _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
         return access_token
 
     except requests.RequestException as error:
+        _record_failed_token_refresh_attempt(zoom_oauth_connection)
         _raise_if_error_is_authentication_error(error)
         log_bounded_exception(
             logger,
@@ -187,14 +351,40 @@ def _get_access_token(zoom_oauth_connection) -> str:
         raise ZoomAPIError("zoom_refresh_failed") from None
 
 
-def _make_zoom_api_request(url: str, access_token: str, params: dict) -> dict:
+def _make_zoom_api_request(url: str, access_token: str, params: dict, *, retry_transport_errors: bool = False, before_retry=None) -> dict:
+    """GET a Zoom API resource.
+
+    retry_transport_errors is for idempotent GETs only: a connection error or
+    timeout is resent up to ZOOM_API_GET_MAX_ATTEMPTS times with backoff. An
+    HTTP error response is never retried. before_retry runs before each resend
+    and may raise to stop it.
+    """
+
     headers = {"Authorization": f"Bearer {access_token}"}
 
     req = requests.Request("GET", url, headers=headers, params=params).prepare()
+    max_attempts = ZOOM_API_GET_MAX_ATTEMPTS if retry_transport_errors else 1
     try:
-        # Send the request
-        with requests.Session() as s:
-            resp = s.send(req, timeout=25)
+        attempt = 1
+        while True:
+            try:
+                # Send the request
+                with requests.Session() as s:
+                    resp = s.send(req, timeout=25)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
+                if attempt >= max_attempts:
+                    raise
+                exception_class, _ = bounded_exception_metadata(error)
+                logger.warning(
+                    "zoom_api_request_retrying code=transport_error attempt=%s exception_class=%s",
+                    attempt,
+                    exception_class,
+                )
+            time.sleep(_transport_retry_delay_seconds(attempt))
+            if before_retry is not None:
+                before_retry()
+            attempt += 1
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as error:
@@ -221,9 +411,18 @@ def _get_local_recording_token(meeting_id: str, access_token: str) -> str:
     return response_data.get("token")
 
 
-def _get_onbehalf_token(meeting_id: str, access_token: str) -> str:
+def _get_onbehalf_token(meeting_id: str, access_token: str, zoom_oauth_connection: ZoomOAuthConnection | None = None) -> str:
     base_url = f"https://api.zoom.us/v2/users/me/token?type=onbehalf&meeting_id={meeting_id}"
-    response_data = _make_zoom_api_request(base_url, access_token, {})
+
+    # SkyTerra: this GET is idempotent (it issues a short-lived join token and
+    # changes no grant state), so a transport failure is resent. Before each
+    # resend the connection must still be writable: a removal that began in the
+    # meantime ends the attempt instead of fetching a token for it.
+    def before_retry():
+        if zoom_oauth_connection is not None:
+            _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
+
+    response_data = _make_zoom_api_request(base_url, access_token, {}, retry_transport_errors=True, before_retry=before_retry)
     return response_data.get("token")
 
 
@@ -441,7 +640,7 @@ def _get_onbehalf_token_and_failure_reason_via_zoom_oauth_app(bot: Bot) -> tuple
     try:
         access_token = _get_access_token(zoom_oauth_connection)
         _assert_zoom_oauth_connection_writable(zoom_oauth_connection)
-        onbehalf_token = _get_onbehalf_token(meeting_id, access_token)
+        onbehalf_token = _get_onbehalf_token(meeting_id, access_token, zoom_oauth_connection)
         if not onbehalf_token:
             return None, ONBEHALF_TOKEN_FAILURE_ZOOM_API_RETURNED_NO_TOKEN
         return onbehalf_token, None
