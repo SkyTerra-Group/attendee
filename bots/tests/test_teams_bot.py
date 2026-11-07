@@ -205,6 +205,56 @@ class TestTeamsBot(TransactionTestCase):
     @patch("bots.web_bot_adapter.web_bot_adapter.Display")
     @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
     @patch("bots.bot_controller.bot_controller.S3FileUploader")
+    def test_ui_element_not_found_cleans_up_when_screenshot_storage_fails(
+        self,
+        MockFileUploader,
+        MockChromeDriver,
+        MockDisplay,
+    ):
+        """A debug screenshot that cannot be stored must not skip cleanup(): unguarded, the
+        storage exception left the bot process (and its worker slot) alive until the Celery
+        hard time limit."""
+        MockFileUploader.return_value = create_mock_file_uploader()
+        mock_driver = create_mock_teams_driver()
+        MockChromeDriver.return_value = mock_driver
+        MockDisplay.return_value = MagicMock()
+
+        class FailingStorage(InMemoryStorage):
+            def _save(self, name, content):
+                raise ValueError("Required parameter name not set")
+
+        controller = BotController(self.bot.id)
+        cleanup = patch.object(controller, "cleanup", wraps=controller.cleanup)
+
+        def save_screenshot_mock(path):
+            with open(path, "w"):
+                pass
+
+        mock_driver.save_screenshot.side_effect = save_screenshot_mock
+        with (
+            patch("bots.teams_bot_adapter.teams_ui_methods.TeamsUIMethods.attempt_to_join_meeting") as mock_attempt_to_join,
+            patch.object(BotDebugScreenshot._meta.get_field("file"), "storage", FailingStorage()),
+            cleanup as mock_cleanup,
+        ):
+            mock_attempt_to_join.side_effect = Exception("random exception")
+            bot_thread = threading.Thread(target=controller.run)
+            bot_thread.daemon = True
+            bot_thread.start()
+            bot_thread.join(timeout=30)
+
+            self.assertFalse(bot_thread.is_alive(), "the bot must finish even though its screenshot could not be stored")
+            self.assertGreaterEqual(mock_cleanup.call_count, 1, "cleanup() must run after a UI element not found")
+            connection.close()
+
+            self.bot.refresh_from_db()
+            last_bot_event = self.bot.bot_events.last()
+            self.assertEqual(last_bot_event.event_type, BotEventTypes.FATAL_ERROR)
+            self.assertEqual(last_bot_event.event_sub_type, BotEventSubTypes.FATAL_ERROR_UI_ELEMENT_NOT_FOUND)
+            self.assertEqual(self.bot.state, BotStates.FATAL_ERROR)
+
+    @patch("bots.web_bot_adapter.web_bot_adapter.Display")
+    @patch("bots.web_bot_adapter.web_bot_adapter.webdriver.Chrome")
+    @patch("bots.bot_controller.bot_controller.S3FileUploader")
     def test_attendee_internal_error_in_main_loop(
         self,
         MockFileUploader,
