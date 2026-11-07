@@ -2021,30 +2021,12 @@ class BotController:
 
             logger.info(f"Created bot event for #{self.bot_in_db.object_id} for UI element not found. Exception info: {message}")
 
-            if screenshot_available:
-                # Create debug screenshot
-                debug_screenshot = BotDebugScreenshot.objects.create(bot_event=new_bot_event)
-
-                # Read the file content from the path
-                with open(message.get("screenshot_path"), "rb") as f:
-                    screenshot_content = f.read()
-                    debug_screenshot.file.save(
-                        f"debug_screenshot_{debug_screenshot.object_id}.png",
-                        ContentFile(screenshot_content),
-                        save=True,
-                    )
-
-            if mhtml_file_available:
-                # Create debug screenshot
-                mhtml_debug_screenshot = BotDebugScreenshot.objects.create(bot_event=new_bot_event)
-
-                with open(message.get("mhtml_file_path"), "rb") as f:
-                    mhtml_content = f.read()
-                    mhtml_debug_screenshot.file.save(
-                        f"debug_screenshot_{mhtml_debug_screenshot.object_id}.mhtml",
-                        ContentFile(mhtml_content),
-                        save=True,
-                    )
+            # Through the guarded helper: a screenshot that cannot be stored (no storage bucket is
+            # configured, or the store is down) must not skip cleanup(). Unguarded, the exception
+            # left the bot process alive until Celery's hard time limit, holding a worker slot and,
+            # on the on-demand AWS worker, keeping the machine running for hours.
+            if screenshot_available or mhtml_file_available:
+                self.save_debug_artifacts(message, new_bot_event)
 
             self.cleanup()
             return
