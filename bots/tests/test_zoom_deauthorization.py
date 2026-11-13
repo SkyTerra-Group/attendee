@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from django.apps import apps as django_apps
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import (
@@ -93,7 +94,12 @@ from bots.zoom_deauthorization_grants import (
     expected_client_id_digest,
     provider_identity_digest,
 )
-from bots.zoom_deauthorization_readiness import DeauthorizationReadinessError, collect_readiness
+from bots.zoom_deauthorization_readiness import (
+    _REQUIRED_CONSTRAINTS,
+    _RESTORED_CONSTRAINTS,
+    DeauthorizationReadinessError,
+    collect_readiness,
+)
 from bots.zoom_oauth_connections_api_utils import create_zoom_oauth_connection
 from bots.zoom_removal_audit import (
     AuditKeyringError,
@@ -2049,6 +2055,163 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             with django_db_connection.cursor() as cursor:
                 cursor.execute(original_definition)
         collect_readiness(project=self.project, app=self.zoom_app)
+
+    # -- the three CHECK constraints after a dump and restore (the 7 Nov 2026 move to RDS) ---------------------
+
+    def _constraint(self, table, name):
+        """(definition, validated) as the readiness check reads them."""
+        with django_db_connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT pg_get_constraintdef(constraint_row.oid), constraint_row.convalidated
+                  FROM pg_constraint constraint_row
+                  JOIN pg_class relation ON relation.oid = constraint_row.conrelid
+                  JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                 WHERE namespace.nspname = current_schema()
+                   AND relation.relname = %s AND constraint_row.conname = %s
+                """,
+                [table, name],
+            )
+            return cursor.fetchone()
+
+    def _replace_constraint(self, table, name, definition):
+        """Drop one CHECK and add it again from text: what pg_restore does with the text pg_dump wrote."""
+        with django_db_connection.cursor() as cursor:
+            cursor.execute(
+                f'ALTER TABLE "{table}" DROP CONSTRAINT "{name}", ADD CONSTRAINT "{name}" {definition}'
+            )
+
+    def _migrate_constraint_again(self, table, name):
+        """Back to what the migrations made, from the model's own definition (never from printed text)."""
+        model = next(
+            candidate
+            for candidate in django_apps.get_app_config("bots").get_models()
+            if candidate._meta.db_table == table
+        )
+        constraint = next(candidate for candidate in model._meta.constraints if candidate.name == name)
+        with django_db_connection.schema_editor() as editor:
+            editor.remove_constraint(model, constraint)
+            editor.add_constraint(model, constraint)
+
+    def _assert_schema_unavailable(self):
+        with self.assertRaises(DeauthorizationReadinessError) as raised:
+            collect_readiness(project=self.project, app=self.zoom_app)
+        self.assertEqual(raised.exception.code, "schema_unavailable")
+
+    def test_restored_constraint_fingerprints_name_only_pinned_check_constraints(self):
+        self.assertEqual(len(_RESTORED_CONSTRAINTS), 3)
+        for constraint, restored in _RESTORED_CONSTRAINTS.items():
+            kind, pinned = _REQUIRED_CONSTRAINTS[constraint]
+            self.assertEqual(kind, "c")
+            self.assertRegex(restored, r"^[0-9a-f]{64}$")
+            self.assertNotEqual(restored, pinned)
+
+    def test_schema_readiness_accepts_the_three_constraints_as_a_dump_and_restore_prints_them(self):
+        collect_readiness(project=self.project, app=self.zoom_app)
+        try:
+            for (table, name), restored_fingerprint in _RESTORED_CONSTRAINTS.items():
+                migrated, validated = self._constraint(table, name)
+                self.assertTrue(validated)
+                self.assertEqual(
+                    hashlib.sha256(migrated.encode("utf-8")).hexdigest(),
+                    _REQUIRED_CONSTRAINTS[(table, name)][1],
+                )
+                # pg_dump writes exactly this text; the server parses it into another expression.
+                self._replace_constraint(table, name, migrated)
+                restored, validated = self._constraint(table, name)
+                self.assertTrue(validated)
+                self.assertNotEqual(restored, migrated)
+                self.assertEqual(hashlib.sha256(restored.encode("utf-8")).hexdigest(), restored_fingerprint)
+                # A second dump and restore prints the same text again: one extra form, not an open set.
+                self._replace_constraint(table, name, restored)
+                self.assertEqual(self._constraint(table, name), (restored, True))
+                # One restored constraint among migrated ones is ready too (a partial repair is not a trap).
+                collect_readiness(project=self.project, app=self.zoom_app)
+            collect_readiness(project=self.project, app=self.zoom_app)
+        finally:
+            for table, name in _RESTORED_CONSTRAINTS:
+                self._migrate_constraint_again(table, name)
+        for (table, name) in _RESTORED_CONSTRAINTS:
+            migrated, validated = self._constraint(table, name)
+            self.assertTrue(validated)
+            self.assertEqual(
+                hashlib.sha256(migrated.encode("utf-8")).hexdigest(),
+                _REQUIRED_CONSTRAINTS[(table, name)][1],
+            )
+        collect_readiness(project=self.project, app=self.zoom_app)
+
+    def test_schema_readiness_rejects_any_other_text_under_a_restored_constraint_name(self):
+        table, name = "bots_zoomoauthauthorizationgrant", "zoom_grant_legacy_recovery_outcome_valid"
+        migrated, _validated = self._constraint(table, name)
+        payload = {
+            "zoom_oauth_app_binding": str(self.app_binding),
+            "authorization_code": "must-not-exchange",
+            "redirect_uri": "https://client-agent.test/callback",
+        }
+        try:
+            for weakened in (
+                "CHECK (legacy_recovery_outcome IS NULL OR legacy_recovery_outcome "
+                "IN ('successor_linked', 'unrecoverable', 'anything'))",
+                "CHECK (legacy_recovery_outcome IS NULL OR legacy_recovery_outcome IN ('successor_linked'))",
+                "CHECK (true)",
+            ):
+                with self.subTest(weakened=weakened):
+                    self._replace_constraint(table, name, weakened)
+                    self._assert_schema_unavailable()
+            # The restored text itself, but never validated against the rows that exist.
+            self._replace_constraint(table, name, migrated)
+            restored, _validated = self._constraint(table, name)
+            self.assertEqual(
+                hashlib.sha256(restored.encode("utf-8")).hexdigest(),
+                _RESTORED_CONSTRAINTS[(table, name)],
+            )
+            self._replace_constraint(table, name, restored + " NOT VALID")
+            self.assertEqual(self._constraint(table, name)[1], False)
+            self._assert_schema_unavailable()
+            # The OAuth callback meets the same refusal before Zoom is called, and now names it in the log.
+            with patch(
+                "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens"
+            ) as exchange, self.assertLogs("bots.zoom_oauth_connections_api_utils", level="WARNING") as logs:
+                connection, error = create_zoom_oauth_connection(payload, self.project)
+            self.assertIsNone(connection)
+            self.assertEqual(error, {"error": "Zoom authorization lineage could not be recorded safely."})
+            exchange.assert_not_called()
+            self.assertEqual(
+                [record.getMessage() for record in logs.records],
+                ["zoom_oauth_authorization_failed code=capture_not_ready readiness=schema_unavailable"],
+            )
+        finally:
+            self._migrate_constraint_again(table, name)
+        collect_readiness(project=self.project, app=self.zoom_app)
+
+    def test_refused_capture_never_logs_a_code_that_is_not_one_of_its_own(self):
+        payload = {
+            "zoom_oauth_app_binding": str(self.app_binding),
+            "authorization_code": "must-not-exchange",
+            "redirect_uri": "https://client-agent.test/callback",
+        }
+        for code, logged in (
+            ("legacy_recovery_incomplete", "legacy_recovery_incomplete"),
+            ("zoa_LOG_CANARY_1234?code=authorization-code-canary", "unrecognized"),
+            ("Schema Unavailable", "unrecognized"),
+            ("x" * 65, "unrecognized"),
+            ("", "unrecognized"),
+            (None, "unrecognized"),
+        ):
+            with self.subTest(code=code), patch(
+                "bots.zoom_oauth_connections_api_utils.assert_capture_ready",
+                side_effect=DeauthorizationReadinessError(code),
+            ), patch(
+                "bots.zoom_oauth_connections_api_utils._exchange_access_code_for_tokens"
+            ) as exchange, self.assertLogs("bots.zoom_oauth_connections_api_utils", level="WARNING") as logs:
+                connection, error = create_zoom_oauth_connection(payload, self.project)
+                self.assertIsNone(connection)
+                self.assertEqual(error, {"error": "Zoom authorization lineage could not be recorded safely."})
+                exchange.assert_not_called()
+                self.assertEqual(
+                    [record.getMessage() for record in logs.records],
+                    ["zoom_oauth_authorization_failed code=capture_not_ready readiness=" + logged],
+                )
 
     def test_audit_key_fingerprint_registry_is_permanent_and_detects_same_kid_replacement(self):
         registered = ZoomRemovalAuditKeyFingerprint.objects.get(
