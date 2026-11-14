@@ -767,6 +767,59 @@ def collect_readiness(
     )
 
 
+def signed_deauthorization_enrolled(app: ZoomOAuthApp) -> bool:
+    """Has this exact Zoom app ever been made part of signed deauthorization? Fails closed.
+
+    Enrolled when ANY of these holds, so that taking one piece of configuration away can never reopen the
+    unbound OAuth callback for an app that has signed history:
+
+    - the audit keyring names its exact (project, binding), or cannot be read;
+    - the signer registry names its exact (project, binding), or cannot be read;
+    - a key fingerprint is registered for it, or its legacy recovery marker is written;
+    - it has a lineage or a grant that carries an audit key.
+
+    Only an app with none of them is "never enrolled": no binding it could send would pass
+    ``assert_capture_ready`` (audit_key_unavailable), and nothing signed exists for it to protect.
+    """
+    project_object_id = app.project.object_id
+    binding = str(app.deauthorization_binding_id)
+    try:
+        rings = configured_audit_keyrings().rings
+    except AuditKeyringError:
+        return True
+    if any(ring.project_object_id == project_object_id and ring.app_binding == binding for ring in rings):
+        return True
+    try:
+        signer_registry = _registry()
+    except Exception:
+        return True
+    if type(signer_registry) is not dict:
+        return True
+    project_signers = signer_registry.get(project_object_id)
+    if project_signers is not None and (type(project_signers) is not dict or binding in project_signers):
+        return True
+    if app.legacy_recovery_completed_at is not None or app.legacy_recovery_ring_fingerprint:
+        return True
+    if ZoomRemovalAuditKeyFingerprint.objects.filter(zoom_oauth_app=app).exists():
+        return True
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                       SELECT 1 FROM bots_zoomoauthauthorizationlineage
+                        WHERE zoom_oauth_app_id = %s AND identity_audit_key_id IS NOT NULL
+                   )
+                OR EXISTS (
+                       SELECT 1 FROM bots_zoomoauthauthorizationgrant
+                        WHERE zoom_oauth_app_id = %s
+                          AND (identity_audit_key_id IS NOT NULL OR connection_audit_key_id IS NOT NULL)
+                   )
+            """,
+            [app.pk, app.pk],
+        )
+        return bool(cursor.fetchone()[0])
+
+
 def assert_capture_ready(
     app: ZoomOAuthApp,
     *,
