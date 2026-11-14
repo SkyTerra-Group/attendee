@@ -1,5 +1,6 @@
 import base64
 import logging
+import re
 import uuid
 
 import requests
@@ -45,6 +46,21 @@ def _exchange_access_code_for_tokens(code: str, redirect_uri: str, client_id: st
     resp = requests.post("https://zoom.us/oauth/token", headers=headers, data=data, timeout=10)
     resp.raise_for_status()
     return resp.json()  # {access_token, refresh_token, expires_in, …}
+
+
+_READINESS_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _log_capture_not_ready(code) -> None:
+    """Name the readiness check that refused a connection.
+
+    The caller gets one fixed sentence whatever the reason, so without this line a refusal leaves no trace here
+    and the calling service can log only that the lineage "could not be recorded safely" (7 to 14 Nov 2026: a week
+    of refused connections whose cause, schema_unavailable, no log named). The code is one of this
+    service's own literals (``_fail("schema_unavailable")`` and its siblings); anything else is logged as
+    "unrecognized", so no value from a request, a provider or the database can reach the line."""
+    safe = code if type(code) is str and _READINESS_CODE_RE.fullmatch(code) else "unrecognized"
+    logger.warning("zoom_oauth_authorization_failed code=capture_not_ready readiness=%s", safe)
 
 
 def create_zoom_oauth_connection(data, project):
@@ -99,7 +115,8 @@ def create_zoom_oauth_connection(data, project):
     if validated_data["zoom_oauth_app_binding"]:
         try:
             assert_capture_ready(zoom_oauth_app)
-        except DeauthorizationReadinessError:
+        except DeauthorizationReadinessError as error:
+            _log_capture_not_ready(error.code)
             return None, {"error": "Zoom authorization lineage could not be recorded safely."}
 
     # Exchange the access code for tokens
@@ -178,7 +195,8 @@ def create_zoom_oauth_connection(data, project):
             if validated_data["zoom_oauth_app_binding"]:
                 try:
                     assert_capture_ready(zoom_oauth_app)
-                except DeauthorizationReadinessError:
+                except DeauthorizationReadinessError as error:
+                    _log_capture_not_ready(error.code)
                     return None, {
                         "error": "Zoom authorization lineage could not be recorded safely."
                     }
@@ -234,7 +252,8 @@ def create_zoom_oauth_connection(data, project):
 
             return zoom_oauth_connection, None
 
-    except GrantCaptureUnavailable:
+    except GrantCaptureUnavailable as error:
+        _log_capture_not_ready(error.args[0] if error.args else "")
         return None, {"error": "Zoom authorization lineage could not be recorded safely."}
     except IntegrityError as error:
         error_id = str(uuid.uuid4())

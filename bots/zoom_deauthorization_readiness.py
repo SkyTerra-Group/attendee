@@ -118,6 +118,25 @@ _REQUIRED_CONSTRAINTS = {
     ("bots_zoomremovaloperationidentifier", "unique_zoom_operation_identifier_namespace"): ("u", "24f5ada0f84505ef8d84d8a8da81a844bb4b803bb9142876bfd4546f2e8ab307"),
 }
 
+# The same three constraints as a dumped and restored database prints them (constraint type "c", validated).
+#
+# pg_dump writes a CHECK as pg_get_constraintdef prints it, and PostgreSQL parses that text back into another,
+# equivalent expression for ``varchar_column IN ('a', 'b')``. A freshly migrated database prints
+#     ((col)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[]))
+# and a restored one prints
+#     ((col)::text = ANY (ARRAY[('a'::character varying)::text, ('b'::character varying)::text]))
+# which is its own fixed point: another dump and restore prints it again. Same rule, other text, other SHA-256.
+# The database moved to RDS by dump and restore on 7 Nov 2026, and from then every signed operation (the OAuth
+# callback's grant capture, resolve, settle, recover, the local credential purge) answered schema_unavailable.
+# These are exact fingerprints, read from that database and reproduced by one pg_dump and pg_restore of a freshly
+# migrated PostgreSQL 18.6: any other definition under these names still fails, and so does a constraint that is
+# NOT VALID.
+_RESTORED_CONSTRAINTS = {
+    ("bots_zoomdeauthorizationassertionreceipt", "zoom_assertion_receipt_target_matches_purpose"): "cc4b540959fb5f810abd0886a39124cf14de367c04aa7c9c33b0188beda40df6",
+    ("bots_zoomdeauthorizationtargetresolution", "zoom_deauth_resolution_target_shape"): "b1b8c1c620dab17bb37d14d20388f4898cdb7b67f0530b8a19a35a249a79460b",
+    ("bots_zoomoauthauthorizationgrant", "zoom_grant_legacy_recovery_outcome_valid"): "3a550798511ee1f64a59f8d231adc9bdf79ea5bce58f8e1a8dc1b56270af39bf",
+}
+
 _REQUIRED_INDEXES = {
     ("bots_zoomremovaloperation", "unique_zoom_local_purge_grant"): "74d1bac91afa5cbac18a4b4e9ced35e4d4374fb21d84d6c803ac71aa69dc9be0",
     ("bots_zoomdeauthorizationeventbinding", "unique_zoom_deauthorization_binding_operation"): "7aa4a3f6b7a41f2693bb60aa5b831b03a86eacdb24ff5bc6514cf4b53cb3be9d",
@@ -221,6 +240,14 @@ def _validate_routes() -> None:
         _fail("route_unavailable")
 
 
+def _constraint_as_pinned(found, constraint, expected) -> bool:
+    """A validated constraint whose definition is the pinned text, or its one known restored form."""
+    if found == (*expected, True):
+        return True
+    restored = _RESTORED_CONSTRAINTS.get(constraint)
+    return restored is not None and found == (expected[0], restored, True)
+
+
 def _validate_schema() -> None:
     applied = set(
         MigrationRecorder.Migration.objects.filter(app="bots", name__in=_REQUIRED_MIGRATIONS).values_list(
@@ -318,8 +345,8 @@ def _validate_schema() -> None:
         for trigger, expected in _REQUIRED_TRIGGERS.items()
     ):
         _fail("schema_unavailable")
-    if any(
-        constraint_rows.get(constraint) != (*expected, True)
+    if not all(
+        _constraint_as_pinned(constraint_rows.get(constraint), constraint, expected)
         for constraint, expected in _REQUIRED_CONSTRAINTS.items()
     ):
         _fail("schema_unavailable")
