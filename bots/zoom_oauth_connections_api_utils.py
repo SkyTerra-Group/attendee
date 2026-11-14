@@ -22,7 +22,11 @@ from .zoom_deauthorization_grants import (
     close_authorization_grant_for_replacement,
     valid_provider_identity_component,
 )
-from .zoom_deauthorization_readiness import DeauthorizationReadinessError, assert_capture_ready
+from .zoom_deauthorization_readiness import (
+    DeauthorizationReadinessError,
+    assert_capture_ready,
+    signed_deauthorization_enrolled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +67,28 @@ def _log_capture_not_ready(code) -> None:
     logger.warning("zoom_oauth_authorization_failed code=capture_not_ready readiness=%s", safe)
 
 
+def _exact_binding_required(zoom_oauth_app) -> bool:
+    """Must a callback for this app name its exact binding, and so take part in signed grant capture?
+
+    Always once the app has a clean-history baseline. While capture is enabled, for every app of a project that
+    is, or ever was, enrolled in signed deauthorization (``signed_deauthorization_enrolled``, which is per project
+    and fails closed).
+
+    Capture is switched on for the whole service, and one service holds several projects. A project that was
+    never enrolled has no binding it can send: ``assert_capture_ready`` answers audit_key_unavailable for its
+    app. Requiring one all the same refused every Zoom connection of every other project (SkyTerra's staging
+    project, from the day capture was enabled for production, 21 Oct 2026) and protected nothing. Such an app
+    stays behind its permanent unknown-history barrier, so nothing recorded for it later can read as complete
+    history, and a connection it gains without a grant is exactly what the legacy backfill must recover before
+    the project can be enrolled (collect_readiness answers legacy_recovery_incomplete until then).
+    """
+    if not zoom_oauth_app.legacy_history_unknown:
+        return True
+    if not settings.ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE:
+        return False
+    return signed_deauthorization_enrolled(zoom_oauth_app)
+
+
 def create_zoom_oauth_connection(data, project):
     """
     Create a new zoom oauth connection for the given project.
@@ -100,13 +126,11 @@ def create_zoom_oauth_connection(data, project):
     except ZoomOAuthApp.DoesNotExist:
         return None, {"error": "Zoom OAuth App was not found in the authenticated project."}
 
-    # Once exact capture is enabled, or an app has an explicit clean-history
-    # baseline, a legacy callback would create untracked authorization history
-    # and could later masquerade as a complete sequence-one identity.
-    if not validated_data["zoom_oauth_app_binding"] and (
-        settings.ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE
-        or not zoom_oauth_app.legacy_history_unknown
-    ):
+    # Once exact capture is enabled for an app that takes part in signed
+    # deauthorization, or an app has an explicit clean-history baseline, a
+    # legacy callback would create untracked authorization history and could
+    # later masquerade as a complete sequence-one identity.
+    if not validated_data["zoom_oauth_app_binding"] and _exact_binding_required(zoom_oauth_app):
         return None, {"error": "Exact Zoom OAuth app binding is required."}
 
     # An exact binding is an explicit request to participate in signed
@@ -187,10 +211,7 @@ def create_zoom_oauth_connection(data, project):
             # Re-evaluate eligibility under the same app lock used by capture.
             # A recovery/baseline transaction may have changed the barrier
             # while this callback was waiting on provider I/O.
-            if not validated_data["zoom_oauth_app_binding"] and (
-                settings.ENABLE_ZOOM_DEAUTHORIZATION_GRANT_CAPTURE
-                or not zoom_oauth_app.legacy_history_unknown
-            ):
+            if not validated_data["zoom_oauth_app_binding"] and _exact_binding_required(zoom_oauth_app):
                 return None, {"error": "Exact Zoom OAuth app binding is required."}
             if validated_data["zoom_oauth_app_binding"]:
                 try:
