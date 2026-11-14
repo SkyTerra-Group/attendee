@@ -2830,6 +2830,16 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(error, {"error": "Exact Zoom OAuth app binding is required."})
         exchange.assert_not_called()
 
+        # Enrollment is per project: a brand-new app record beside the enrolled one has no trace of its own,
+        # and is refused all the same.
+        sibling = self.never_enrolled_app(self.project)
+        self.assertTrue(signed_deauthorization_enrolled(sibling))
+        refused, error, exchange = self.unbound_callback(self.project, sibling)
+        self.assertIsNone(refused)
+        self.assertEqual(error, {"error": "Exact Zoom OAuth app binding is required."})
+        exchange.assert_not_called()
+        self.assertFalse(ZoomOAuthConnection.objects.filter(zoom_oauth_app=sibling).exists())
+
     def test_any_trace_of_enrollment_keeps_the_exact_binding_required(self):
         def ring_only(app):
             self.audit_ring_entries[(app.project.object_id, str(app.deauthorization_binding_id))] = {
@@ -2876,12 +2886,21 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 )
             return None
 
+        def on_a_sibling(leave_trace):
+            """The same trace, left on ANOTHER app of the project: enrollment is per project."""
+            return lambda app: leave_trace(self.never_enrolled_app(app.project))
+
         traces = {
             "audit keyring names the app": ring_only,
             "signer registry names the app": signer_only,
             "a key fingerprint is registered": registered_key_only,
             "the legacy recovery marker is written": recovery_marker_only,
             "a keyed lineage exists": keyed_lineage_only,
+            "audit keyring names another app of the project": on_a_sibling(ring_only),
+            "signer registry names another app of the project": on_a_sibling(signer_only),
+            "a key fingerprint is registered for another app of the project": on_a_sibling(registered_key_only),
+            "another app of the project has its recovery marker": on_a_sibling(recovery_marker_only),
+            "another app of the project has a keyed lineage": on_a_sibling(keyed_lineage_only),
             "the audit keyring is empty": lambda app: override_settings(ZOOM_REMOVAL_AUDIT_KEYRING_JSON="{}"),
             "the audit keyring is not JSON": lambda app: override_settings(ZOOM_REMOVAL_AUDIT_KEYRING_JSON="not json"),
             "the signer registry is not JSON": lambda app: override_settings(ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON="not json"),
@@ -2901,7 +2920,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 try:
                     app.refresh_from_db()
                     self.assertTrue(signed_deauthorization_enrolled(app))
-                    connection, error, exchange = self.unbound_callback(project)
+                    connection, error, exchange = self.unbound_callback(project, app)
                 finally:
                     if override is not None:
                         override.disable()
@@ -2929,27 +2948,49 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertEqual(error, {"error": "Exact Zoom OAuth app binding is required."})
         exchange.assert_not_called()
 
-    def test_unbound_connection_blocks_later_enrollment_until_the_legacy_recovery_runs(self):
-        app = self.never_enrolled_app(self.project)
-        connection, error, _exchange = self.unbound_callback(self.project, app)
+    def test_a_project_with_an_unbound_connection_cannot_be_enrolled_before_the_legacy_recovery(self):
+        app = self.never_enrolled_app(self.other_project)
+        connection, error, _exchange = self.unbound_callback(self.other_project)
         self.assertIsNone(error)
         self.assertFalse(ZoomOAuthAuthorizationGrant.objects.filter(live_connection=connection).exists())
-        registry, _audience = self.add_registry_app(app)
+
+        # Enroll it: a ring with its registered key, and a signer entry for its exact scope.
+        self.add_audit_ring(app)
+        signer_key = Ed25519PrivateKey.from_private_bytes(
+            hashlib.sha256(f"signer:{app.deauthorization_binding_id}".encode("ascii")).digest()
+        ).public_key().public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+        registry = json.loads(json.dumps(self.registry))
+        registry[self.other_project.object_id] = {
+            str(app.deauthorization_binding_id): {
+                "zoom_oauth_app_id": app.pk,
+                "expected_client_id_digest": expected_client_id_digest(app.client_id),
+                "issuer": TEST_ISSUER + "-other-project",
+                "audience": (
+                    f"urn:attendee:test:{self.other_project.object_id}:"
+                    f"{app.deauthorization_binding_id}:zoom-deauthorization"
+                ),
+                "keys": {TEST_KID: b64url(signer_key)},
+            }
+        }
         with override_settings(ZOOM_DEAUTH_TRUSTED_SIGNERS_JSON=registry):
+            self.assertTrue(signed_deauthorization_enrolled(app))
+            # Not ready until the legacy recovery has run; that recovery is what quarantines a connection
+            # without a grant (test_backfill_quarantines_live_connection_without_grant_before_marker).
             with self.assertRaises(DeauthorizationReadinessError) as raised:
-                collect_readiness(project=self.project, app=app)
+                collect_readiness(project=self.other_project, app=app)
             self.assertEqual(raised.exception.code, "legacy_recovery_incomplete")
             # Enrolled now: no further unbound callback, and no capture until the recovery has run.
-            refused, error, exchange = self.unbound_callback(self.project, app, user_id="later-user")
+            refused, error, exchange = self.unbound_callback(self.other_project, user_id="later-user")
             self.assertIsNone(refused)
             self.assertEqual(error, {"error": "Exact Zoom OAuth app binding is required."})
             exchange.assert_not_called()
             refused, error, exchange = self.unbound_callback(
-                self.project, app, user_id="later-user", binding=app.deauthorization_binding_id
+                self.other_project, user_id="later-user", binding=app.deauthorization_binding_id
             )
             self.assertIsNone(refused)
             self.assertEqual(error, {"error": "Zoom authorization lineage could not be recorded safely."})
             exchange.assert_not_called()
+        self.assertEqual(ZoomOAuthConnection.objects.filter(zoom_oauth_app=app).count(), 1)
 
     def test_unbound_callback_rechecks_enrollment_after_provider_io(self):
         app = self.never_enrolled_app(self.other_project)
@@ -2983,8 +3024,11 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
         self.assertFalse(ZoomOAuthConnection.objects.filter(zoom_oauth_app=app).exists())
 
     def test_legacy_callback_rechecks_clean_baseline_after_provider_io(self):
+        # In a project that was never enrolled: there the callback is not refused before the exchange, so this
+        # test reaches the re-check under the app lock that it is named for. (In an enrolled project, and on
+        # every project before enrollment was told apart, the first check refused it and the re-check never ran.)
         app = ZoomOAuthApp.objects.create(
-            project=self.project,
+            project=self.other_project,
             client_id=f"baseline-race-{uuid.uuid4().hex[:8]}",
         )
         app.set_credentials(
@@ -2998,8 +3042,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
             "authorization_code": "legacy-race-code",
             "redirect_uri": "https://client-agent.test/callback",
         }
-        # The scopes the callback requires: an app that was never enrolled is not refused before the exchange any
-        # more, so this test now reaches the re-check under the app lock that it is named for.
+        # The scopes the callback requires, so the exchange's answer is accepted and the re-check is reached.
         token = {
             "access_token": "legacy-race-access",
             "refresh_token": "legacy-race-refresh",
@@ -3029,7 +3072,7 @@ class ZoomSignedDeauthorizationTests(TransactionTestCase):
                 "status": "active",
             },
         ):
-            connection, error = create_zoom_oauth_connection(payload, self.project)
+            connection, error = create_zoom_oauth_connection(payload, self.other_project)
         self.assertIsNone(connection)
         self.assertEqual(error, {"error": "Exact Zoom OAuth app binding is required."})
         self.assertFalse(ZoomOAuthConnection.objects.filter(zoom_oauth_app=app).exists())

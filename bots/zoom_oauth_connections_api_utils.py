@@ -70,16 +70,17 @@ def _log_capture_not_ready(code) -> None:
 def _exact_binding_required(zoom_oauth_app) -> bool:
     """Must a callback for this app name its exact binding, and so take part in signed grant capture?
 
-    Always once the app has a clean-history baseline. While capture is enabled, for every app that is, or ever
-    was, enrolled in signed deauthorization (``signed_deauthorization_enrolled``, which fails closed).
+    Always once the app has a clean-history baseline. While capture is enabled, for every app of a project that
+    is, or ever was, enrolled in signed deauthorization (``signed_deauthorization_enrolled``, which is per project
+    and fails closed).
 
-    Capture is switched on for the whole service, and one service holds several projects. An app that was never
-    enrolled has no binding it can send: ``assert_capture_ready`` answers audit_key_unavailable for it. Requiring
-    one all the same refused every Zoom connection of every other project (SkyTerra's staging project, from the
-    day capture was enabled for production, 21 Oct 2026) and protected nothing. Such an app stays behind its
-    permanent unknown-history barrier, so nothing recorded for it later can read as complete history, and a
-    connection it gains without a grant is exactly what the legacy backfill must recover before the app can be
-    enrolled (collect_readiness answers legacy_recovery_incomplete until then).
+    Capture is switched on for the whole service, and one service holds several projects. A project that was
+    never enrolled has no binding it can send: ``assert_capture_ready`` answers audit_key_unavailable for its
+    app. Requiring one all the same refused every Zoom connection of every other project (SkyTerra's staging
+    project, from the day capture was enabled for production, 21 Oct 2026) and protected nothing. Such an app
+    stays behind its permanent unknown-history barrier, so nothing recorded for it later can read as complete
+    history, and a connection it gains without a grant is exactly what the legacy backfill must recover before
+    the project can be enrolled (collect_readiness answers legacy_recovery_incomplete until then).
     """
     if not zoom_oauth_app.legacy_history_unknown:
         return True
